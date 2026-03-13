@@ -406,6 +406,205 @@ static const gchar *_live_snapshot_blend_mode_name(const uint32_t blend_mode)
   }
 }
 
+static const gchar *_live_snapshot_blend_colorspace_name(const dt_develop_blend_colorspace_t csp)
+{
+  switch(csp)
+  {
+    case DEVELOP_BLEND_CS_RAW:
+      return "raw";
+    case DEVELOP_BLEND_CS_LAB:
+      return "lab";
+    case DEVELOP_BLEND_CS_RGB_DISPLAY:
+      return "rgb-display";
+    case DEVELOP_BLEND_CS_RGB_SCENE:
+      return "rgb-scene";
+    case DEVELOP_BLEND_CS_NONE:
+    default:
+      return "unknown";
+  }
+}
+
+static gboolean _live_snapshot_parse_blend_mode_name(const gchar *blend_mode_name,
+                                                     uint32_t *blend_mode_out)
+{
+  if(blend_mode_name == NULL || blend_mode_name[0] == '\0') return FALSE;
+
+  struct dt_live_blend_mode_name_t
+  {
+    const gchar *name;
+    uint32_t mode;
+  };
+
+  static const struct dt_live_blend_mode_name_t blend_modes[] = {
+    { "normal", DEVELOP_BLEND_NORMAL2 },
+    { "average", DEVELOP_BLEND_AVERAGE },
+    { "difference", DEVELOP_BLEND_DIFFERENCE2 },
+    { "bounded", DEVELOP_BLEND_BOUNDED },
+    { "lighten", DEVELOP_BLEND_LIGHTEN },
+    { "darken", DEVELOP_BLEND_DARKEN },
+    { "screen", DEVELOP_BLEND_SCREEN },
+    { "multiply", DEVELOP_BLEND_MULTIPLY },
+    { "divide", DEVELOP_BLEND_DIVIDE },
+    { "add", DEVELOP_BLEND_ADD },
+    { "subtract", DEVELOP_BLEND_SUBTRACT },
+    { "geometric-mean", DEVELOP_BLEND_GEOMETRIC_MEAN },
+    { "harmonic-mean", DEVELOP_BLEND_HARMONIC_MEAN },
+    { "overlay", DEVELOP_BLEND_OVERLAY },
+    { "softlight", DEVELOP_BLEND_SOFTLIGHT },
+    { "hardlight", DEVELOP_BLEND_HARDLIGHT },
+    { "vividlight", DEVELOP_BLEND_VIVIDLIGHT },
+    { "linearlight", DEVELOP_BLEND_LINEARLIGHT },
+    { "pinlight", DEVELOP_BLEND_PINLIGHT },
+    { "lightness", DEVELOP_BLEND_LIGHTNESS },
+    { "chromaticity", DEVELOP_BLEND_CHROMATICITY },
+    { "lab-lightness", DEVELOP_BLEND_LAB_LIGHTNESS },
+    { "lab-a", DEVELOP_BLEND_LAB_A },
+    { "lab-b", DEVELOP_BLEND_LAB_B },
+    { "lab-color", DEVELOP_BLEND_LAB_COLOR },
+    { "rgb-r", DEVELOP_BLEND_RGB_R },
+    { "rgb-g", DEVELOP_BLEND_RGB_G },
+    { "rgb-b", DEVELOP_BLEND_RGB_B },
+    { "hsv-value", DEVELOP_BLEND_HSV_VALUE },
+    { "hsv-color", DEVELOP_BLEND_HSV_COLOR },
+    { "hue", DEVELOP_BLEND_HUE },
+    { "color", DEVELOP_BLEND_COLOR },
+    { "coloradjust", DEVELOP_BLEND_COLORADJUST },
+    { "difference-legacy", DEVELOP_BLEND_DIFFERENCE },
+    { "subtract-inverse", DEVELOP_BLEND_SUBTRACT_INVERSE },
+    { "divide-inverse", DEVELOP_BLEND_DIVIDE_INVERSE },
+    { "lab-l", DEVELOP_BLEND_LAB_L },
+    { NULL, 0 },
+  };
+
+  for(const struct dt_live_blend_mode_name_t *blend_mode = blend_modes;
+      blend_mode->name != NULL;
+      blend_mode++)
+  {
+    if(g_strcmp0(blend_mode->name, blend_mode_name) == 0)
+    {
+      if(blend_mode_out != NULL) *blend_mode_out = blend_mode->mode;
+      return TRUE;
+    }
+  }
+
+  return FALSE;
+}
+
+static dt_develop_blend_colorspace_t _live_module_blend_colorspace(dt_iop_module_t *module)
+{
+  if(module == NULL || module->blend_params == NULL) return DEVELOP_BLEND_CS_NONE;
+
+  const dt_develop_blend_colorspace_t default_csp =
+    dt_develop_blend_default_module_blend_colorspace(module);
+  switch(default_csp)
+  {
+    case DEVELOP_BLEND_CS_RAW:
+      return DEVELOP_BLEND_CS_RAW;
+    case DEVELOP_BLEND_CS_LAB:
+    case DEVELOP_BLEND_CS_RGB_DISPLAY:
+    case DEVELOP_BLEND_CS_RGB_SCENE:
+      switch(module->blend_params->blend_cst)
+      {
+        case DEVELOP_BLEND_CS_LAB:
+        case DEVELOP_BLEND_CS_RGB_DISPLAY:
+        case DEVELOP_BLEND_CS_RGB_SCENE:
+          return module->blend_params->blend_cst;
+        default:
+          return default_csp;
+      }
+    case DEVELOP_BLEND_CS_NONE:
+    default:
+      return DEVELOP_BLEND_CS_NONE;
+  }
+}
+
+static gboolean _live_module_blend_mode_supported(const dt_develop_blend_colorspace_t csp,
+                                                   const uint32_t blend_mode)
+{
+  switch(csp)
+  {
+    case DEVELOP_BLEND_CS_LAB:
+      return blend_mode == DEVELOP_BLEND_NORMAL2 || blend_mode == DEVELOP_BLEND_AVERAGE
+             || blend_mode == DEVELOP_BLEND_DIFFERENCE || blend_mode == DEVELOP_BLEND_DIFFERENCE2
+             || blend_mode == DEVELOP_BLEND_BOUNDED || blend_mode == DEVELOP_BLEND_LIGHTEN
+             || blend_mode == DEVELOP_BLEND_DARKEN || blend_mode == DEVELOP_BLEND_SCREEN
+             || blend_mode == DEVELOP_BLEND_MULTIPLY || blend_mode == DEVELOP_BLEND_ADD
+             || blend_mode == DEVELOP_BLEND_SUBTRACT || blend_mode == DEVELOP_BLEND_OVERLAY
+             || blend_mode == DEVELOP_BLEND_SOFTLIGHT || blend_mode == DEVELOP_BLEND_HARDLIGHT
+             || blend_mode == DEVELOP_BLEND_VIVIDLIGHT || blend_mode == DEVELOP_BLEND_LINEARLIGHT
+             || blend_mode == DEVELOP_BLEND_PINLIGHT || blend_mode == DEVELOP_BLEND_LIGHTNESS
+             || blend_mode == DEVELOP_BLEND_CHROMATICITY || blend_mode == DEVELOP_BLEND_HUE
+             || blend_mode == DEVELOP_BLEND_COLOR || blend_mode == DEVELOP_BLEND_COLORADJUST
+             || blend_mode == DEVELOP_BLEND_LAB_LIGHTNESS || blend_mode == DEVELOP_BLEND_LAB_L
+             || blend_mode == DEVELOP_BLEND_LAB_A || blend_mode == DEVELOP_BLEND_LAB_B
+             || blend_mode == DEVELOP_BLEND_LAB_COLOR;
+    case DEVELOP_BLEND_CS_RGB_DISPLAY:
+      return blend_mode == DEVELOP_BLEND_NORMAL2 || blend_mode == DEVELOP_BLEND_AVERAGE
+             || blend_mode == DEVELOP_BLEND_DIFFERENCE || blend_mode == DEVELOP_BLEND_DIFFERENCE2
+             || blend_mode == DEVELOP_BLEND_BOUNDED || blend_mode == DEVELOP_BLEND_LIGHTEN
+             || blend_mode == DEVELOP_BLEND_DARKEN || blend_mode == DEVELOP_BLEND_SCREEN
+             || blend_mode == DEVELOP_BLEND_MULTIPLY || blend_mode == DEVELOP_BLEND_ADD
+             || blend_mode == DEVELOP_BLEND_SUBTRACT || blend_mode == DEVELOP_BLEND_OVERLAY
+             || blend_mode == DEVELOP_BLEND_SOFTLIGHT || blend_mode == DEVELOP_BLEND_HARDLIGHT
+             || blend_mode == DEVELOP_BLEND_VIVIDLIGHT || blend_mode == DEVELOP_BLEND_LINEARLIGHT
+             || blend_mode == DEVELOP_BLEND_PINLIGHT || blend_mode == DEVELOP_BLEND_LIGHTNESS
+             || blend_mode == DEVELOP_BLEND_CHROMATICITY || blend_mode == DEVELOP_BLEND_HUE
+             || blend_mode == DEVELOP_BLEND_COLOR || blend_mode == DEVELOP_BLEND_COLORADJUST
+             || blend_mode == DEVELOP_BLEND_HSV_VALUE || blend_mode == DEVELOP_BLEND_HSV_COLOR
+             || blend_mode == DEVELOP_BLEND_RGB_R || blend_mode == DEVELOP_BLEND_RGB_G
+             || blend_mode == DEVELOP_BLEND_RGB_B;
+    case DEVELOP_BLEND_CS_RAW:
+      return blend_mode == DEVELOP_BLEND_NORMAL2 || blend_mode == DEVELOP_BLEND_AVERAGE
+             || blend_mode == DEVELOP_BLEND_DIFFERENCE || blend_mode == DEVELOP_BLEND_DIFFERENCE2
+             || blend_mode == DEVELOP_BLEND_BOUNDED || blend_mode == DEVELOP_BLEND_LIGHTEN
+             || blend_mode == DEVELOP_BLEND_DARKEN || blend_mode == DEVELOP_BLEND_SCREEN
+             || blend_mode == DEVELOP_BLEND_MULTIPLY || blend_mode == DEVELOP_BLEND_ADD
+             || blend_mode == DEVELOP_BLEND_SUBTRACT || blend_mode == DEVELOP_BLEND_OVERLAY
+             || blend_mode == DEVELOP_BLEND_SOFTLIGHT || blend_mode == DEVELOP_BLEND_HARDLIGHT
+             || blend_mode == DEVELOP_BLEND_VIVIDLIGHT || blend_mode == DEVELOP_BLEND_LINEARLIGHT
+             || blend_mode == DEVELOP_BLEND_PINLIGHT;
+    case DEVELOP_BLEND_CS_RGB_SCENE:
+      return blend_mode == DEVELOP_BLEND_NORMAL2 || blend_mode == DEVELOP_BLEND_AVERAGE
+             || blend_mode == DEVELOP_BLEND_DIFFERENCE || blend_mode == DEVELOP_BLEND_DIFFERENCE2
+             || blend_mode == DEVELOP_BLEND_MULTIPLY || blend_mode == DEVELOP_BLEND_DIVIDE
+             || blend_mode == DEVELOP_BLEND_DIVIDE_INVERSE || blend_mode == DEVELOP_BLEND_ADD
+             || blend_mode == DEVELOP_BLEND_SUBTRACT
+             || blend_mode == DEVELOP_BLEND_SUBTRACT_INVERSE
+             || blend_mode == DEVELOP_BLEND_GEOMETRIC_MEAN
+             || blend_mode == DEVELOP_BLEND_HARMONIC_MEAN || blend_mode == DEVELOP_BLEND_RGB_R
+             || blend_mode == DEVELOP_BLEND_RGB_G || blend_mode == DEVELOP_BLEND_RGB_B
+             || blend_mode == DEVELOP_BLEND_LIGHTNESS || blend_mode == DEVELOP_BLEND_CHROMATICITY;
+    case DEVELOP_BLEND_CS_NONE:
+    default:
+      return FALSE;
+  }
+}
+
+static gboolean _live_module_blend_parameter_enabled(const dt_develop_blend_colorspace_t csp,
+                                                     const uint32_t blend_mode)
+{
+  if(csp == DEVELOP_BLEND_CS_RGB_SCENE)
+  {
+    switch(blend_mode & ~DEVELOP_BLEND_REVERSE)
+    {
+      case DEVELOP_BLEND_ADD:
+      case DEVELOP_BLEND_MULTIPLY:
+      case DEVELOP_BLEND_SUBTRACT:
+      case DEVELOP_BLEND_SUBTRACT_INVERSE:
+      case DEVELOP_BLEND_DIVIDE:
+      case DEVELOP_BLEND_DIVIDE_INVERSE:
+      case DEVELOP_BLEND_RGB_R:
+      case DEVELOP_BLEND_RGB_G:
+      case DEVELOP_BLEND_RGB_B:
+        return TRUE;
+      default:
+        return FALSE;
+    }
+  }
+
+  return FALSE;
+}
+
 static void _live_snapshot_add_blend(JsonBuilder *builder,
                                      const char *module_op,
                                      const dt_iop_module_t *module,
@@ -424,6 +623,7 @@ static void _live_snapshot_add_blend(JsonBuilder *builder,
 
   if(supported)
   {
+    const dt_develop_blend_colorspace_t blend_csp = _live_module_blend_colorspace((dt_iop_module_t *)module);
     json_builder_set_member_name(builder, "opacity");
     json_builder_add_double_value(builder, blend_params->opacity);
     json_builder_set_member_name(builder, "blendMode");
@@ -432,6 +632,8 @@ static void _live_snapshot_add_blend(JsonBuilder *builder,
     json_builder_add_boolean_value(builder,
                                    (blend_params->blend_mode & DEVELOP_BLEND_REVERSE)
                                      == DEVELOP_BLEND_REVERSE);
+    json_builder_set_member_name(builder, "blendColorspace");
+    json_builder_add_string_value(builder, _live_snapshot_blend_colorspace_name(blend_csp));
   }
 
   json_builder_end_object(builder);
@@ -646,10 +848,32 @@ typedef struct dt_live_module_blend_payload_t
   double requested_opacity;
   gboolean have_current_opacity;
   double current_opacity;
+  gboolean have_previous_blend_mode;
+  const gchar *previous_blend_mode;
+  gboolean have_requested_blend_mode;
+  const gchar *requested_blend_mode;
+  gboolean have_current_blend_mode;
+  const gchar *current_blend_mode;
+  gboolean have_previous_reverse_order;
+  gboolean previous_reverse_order;
+  gboolean have_requested_reverse_order;
+  gboolean requested_reverse_order;
+  gboolean have_current_reverse_order;
+  gboolean current_reverse_order;
   gboolean have_history;
   gint history_before;
   gint history_after;
 } dt_live_module_blend_payload_t;
+
+typedef struct dt_live_module_blend_request_t
+{
+  gboolean have_opacity;
+  double opacity;
+  gboolean have_blend_mode;
+  uint32_t blend_mode;
+  gboolean have_reverse_order;
+  gboolean reverse_order;
+} dt_live_module_blend_request_t;
 
 typedef enum dt_live_module_reorder_check_t
 {
@@ -842,6 +1066,42 @@ static void _live_snapshot_add_module_blend(JsonBuilder *builder,
     json_builder_add_double_value(builder, payload->current_opacity);
   }
 
+  if(payload != NULL && payload->have_previous_blend_mode)
+  {
+    json_builder_set_member_name(builder, "previousBlendMode");
+    json_builder_add_string_value(builder, payload->previous_blend_mode);
+  }
+
+  if(payload != NULL && payload->have_requested_blend_mode)
+  {
+    json_builder_set_member_name(builder, "requestedBlendMode");
+    json_builder_add_string_value(builder, payload->requested_blend_mode);
+  }
+
+  if(payload != NULL && payload->have_current_blend_mode)
+  {
+    json_builder_set_member_name(builder, "currentBlendMode");
+    json_builder_add_string_value(builder, payload->current_blend_mode);
+  }
+
+  if(payload != NULL && payload->have_previous_reverse_order)
+  {
+    json_builder_set_member_name(builder, "previousReverseOrder");
+    json_builder_add_boolean_value(builder, payload->previous_reverse_order);
+  }
+
+  if(payload != NULL && payload->have_requested_reverse_order)
+  {
+    json_builder_set_member_name(builder, "requestedReverseOrder");
+    json_builder_add_boolean_value(builder, payload->requested_reverse_order);
+  }
+
+  if(payload != NULL && payload->have_current_reverse_order)
+  {
+    json_builder_set_member_name(builder, "currentReverseOrder");
+    json_builder_add_boolean_value(builder, payload->current_reverse_order);
+  }
+
   if(payload != NULL && payload->have_history)
   {
     json_builder_set_member_name(builder, "historyBefore");
@@ -855,18 +1115,112 @@ static void _live_snapshot_add_module_blend(JsonBuilder *builder,
   json_builder_end_object(builder);
 }
 
+static gboolean _live_parse_module_instance_blend_request(const gchar *json_text,
+                                                          dt_live_module_blend_request_t *request_out)
+{
+  if(json_text == NULL || json_text[0] == '\0' || request_out == NULL) return FALSE;
+
+  g_autoptr(JsonParser) parser = json_parser_new();
+  if(!json_parser_load_from_data(parser, json_text, -1, NULL)) return FALSE;
+
+  JsonNode *root = json_parser_get_root(parser);
+  if(root == NULL || !JSON_NODE_HOLDS_OBJECT(root)) return FALSE;
+
+  JsonObject *object = json_node_get_object(root);
+  if(object == NULL) return FALSE;
+
+  dt_live_module_blend_request_t request = { 0 };
+  GList *members = json_object_get_members(object);
+  for(const GList *iter = members; iter != NULL; iter = g_list_next(iter))
+  {
+    const gchar *key = iter->data;
+    JsonNode *member = json_object_get_member(object, key);
+
+    if(g_strcmp0(key, "opacity") == 0)
+    {
+      const GType value_type = member != NULL && JSON_NODE_HOLDS_VALUE(member)
+                                  ? json_node_get_value_type(member)
+                                  : G_TYPE_INVALID;
+      if(value_type != G_TYPE_DOUBLE && value_type != G_TYPE_INT64 && value_type != G_TYPE_INT
+         && value_type != G_TYPE_UINT64 && value_type != G_TYPE_UINT && value_type != G_TYPE_LONG
+         && value_type != G_TYPE_ULONG)
+      {
+        g_list_free(members);
+        return FALSE;
+      }
+
+      request.have_opacity = TRUE;
+      request.opacity = json_node_get_double(member);
+    }
+    else if(g_strcmp0(key, "blendMode") == 0)
+    {
+      if(member == NULL || !JSON_NODE_HOLDS_VALUE(member)
+         || json_node_get_value_type(member) != G_TYPE_STRING)
+      {
+        g_list_free(members);
+        return FALSE;
+      }
+
+      request.have_blend_mode =
+        _live_snapshot_parse_blend_mode_name(json_node_get_string(member), &request.blend_mode);
+      if(!request.have_blend_mode)
+      {
+        g_list_free(members);
+        return FALSE;
+      }
+    }
+    else if(g_strcmp0(key, "reverseOrder") == 0)
+    {
+      if(member == NULL || !JSON_NODE_HOLDS_VALUE(member)
+         || json_node_get_value_type(member) != G_TYPE_BOOLEAN)
+      {
+        g_list_free(members);
+        return FALSE;
+      }
+
+      request.have_reverse_order = TRUE;
+      request.reverse_order = json_node_get_boolean(member);
+    }
+    else
+    {
+      g_list_free(members);
+      return FALSE;
+    }
+  }
+  g_list_free(members);
+
+  if(!request.have_opacity && !request.have_blend_mode && !request.have_reverse_order) return FALSE;
+
+  *request_out = request;
+  return TRUE;
+}
+
 static gchar *_live_apply_module_instance_blend_to_json(dt_develop_t *dev,
                                                         const gchar *instance_key,
-                                                        const double requested_opacity)
+                                                        const dt_live_module_blend_request_t *request)
 {
   g_autoptr(JsonBuilder) builder = json_builder_new();
   json_builder_begin_object(builder);
 
   dt_live_module_blend_payload_t blend_payload = {
     .instance_key = instance_key,
-    .have_requested_opacity = TRUE,
-    .requested_opacity = requested_opacity,
   };
+
+  if(request != NULL && request->have_opacity)
+  {
+    blend_payload.have_requested_opacity = TRUE;
+    blend_payload.requested_opacity = request->opacity;
+  }
+  if(request != NULL && request->have_blend_mode)
+  {
+    blend_payload.have_requested_blend_mode = TRUE;
+    blend_payload.requested_blend_mode = _live_snapshot_blend_mode_name(request->blend_mode);
+  }
+  if(request != NULL && request->have_reverse_order)
+  {
+    blend_payload.have_requested_reverse_order = TRUE;
+    blend_payload.requested_reverse_order = request->reverse_order;
+  }
 
   if(dt_view_get_current() != DT_VIEW_DARKROOM)
   {
@@ -921,30 +1275,126 @@ static gchar *_live_apply_module_instance_blend_to_json(dt_develop_t *dev,
   }
 
   const double previous_opacity = module->blend_params->opacity;
+  const uint32_t previous_blend_mode = module->blend_params->blend_mode & DEVELOP_BLEND_MODE_MASK;
+  const gboolean previous_reverse_order =
+    (module->blend_params->blend_mode & DEVELOP_BLEND_REVERSE) == DEVELOP_BLEND_REVERSE;
   const gint history_before = dev->history_end;
+  const dt_develop_blend_colorspace_t blend_csp = _live_module_blend_colorspace(module);
 
-  if(fabs(previous_opacity - requested_opacity) > 1e-6)
+  if(request != NULL && request->have_opacity)
   {
-    module->blend_params->opacity = requested_opacity;
-    dt_iop_commit_blend_params(module, module->blend_params);
+    blend_payload.have_previous_opacity = TRUE;
+    blend_payload.previous_opacity = previous_opacity;
+  }
+  if(request != NULL && request->have_blend_mode)
+  {
+    blend_payload.have_previous_blend_mode = TRUE;
+    blend_payload.previous_blend_mode = _live_snapshot_blend_mode_name(previous_blend_mode);
+  }
+  if(request != NULL && request->have_reverse_order)
+  {
+    blend_payload.have_previous_reverse_order = TRUE;
+    blend_payload.previous_reverse_order = previous_reverse_order;
+  }
+
+  if(request != NULL && request->have_blend_mode
+     && !_live_module_blend_mode_supported(blend_csp, request->blend_mode))
+  {
+    if(request->have_opacity)
+    {
+      blend_payload.have_current_opacity = TRUE;
+      blend_payload.current_opacity = previous_opacity;
+    }
+    if(request->have_blend_mode)
+    {
+      blend_payload.have_current_blend_mode = TRUE;
+      blend_payload.current_blend_mode = _live_snapshot_blend_mode_name(previous_blend_mode);
+    }
+    if(request->have_reverse_order)
+    {
+      blend_payload.have_current_reverse_order = TRUE;
+      blend_payload.current_reverse_order = previous_reverse_order;
+    }
+    blend_payload.have_history = TRUE;
+    blend_payload.history_before = history_before;
+    blend_payload.history_after = history_before;
+    _live_snapshot_add_module_blend(builder, &blend_payload);
+    json_builder_set_member_name(builder, "reason");
+    json_builder_add_string_value(builder, "unsupported-module-blend-mode");
+    json_builder_set_member_name(builder, "status");
+    json_builder_add_string_value(builder, "unavailable");
+    json_builder_end_object(builder);
+    return _live_json_builder_to_string(builder);
+  }
+
+  dt_develop_blend_params_t updated_blend_params = *module->blend_params;
+
+  if(request != NULL && request->have_opacity)
+  {
+    updated_blend_params.opacity = request->opacity;
+  }
+
+  if(request != NULL && request->have_blend_mode)
+  {
+    updated_blend_params.blend_mode =
+      request->blend_mode | (updated_blend_params.blend_mode & DEVELOP_BLEND_REVERSE);
+    if(!_live_module_blend_parameter_enabled(blend_csp, updated_blend_params.blend_mode))
+    {
+      updated_blend_params.blend_parameter = 0.0f;
+    }
+  }
+
+  if(request != NULL && request->have_reverse_order)
+  {
+    updated_blend_params.blend_mode &= ~DEVELOP_BLEND_REVERSE;
+    if(request->reverse_order) updated_blend_params.blend_mode |= DEVELOP_BLEND_REVERSE;
+  }
+
+  const gboolean blend_changed =
+    (request != NULL && request->have_opacity && fabs(previous_opacity - updated_blend_params.opacity) > 1e-6)
+    || (request != NULL && request->have_blend_mode
+        && previous_blend_mode != (updated_blend_params.blend_mode & DEVELOP_BLEND_MODE_MASK))
+    || (request != NULL && request->have_reverse_order
+        && previous_reverse_order
+             != ((updated_blend_params.blend_mode & DEVELOP_BLEND_REVERSE) == DEVELOP_BLEND_REVERSE));
+
+  if(blend_changed)
+  {
+    dt_iop_commit_blend_params(module, &updated_blend_params);
     dt_dev_add_history_item(dev, module, module->enabled);
     dt_iop_gui_update_blending(module);
   }
 
   const double current_opacity = module->blend_params->opacity;
+  const uint32_t current_blend_mode = module->blend_params->blend_mode & DEVELOP_BLEND_MODE_MASK;
+  const gboolean current_reverse_order =
+    (module->blend_params->blend_mode & DEVELOP_BLEND_REVERSE) == DEVELOP_BLEND_REVERSE;
   const gint history_after = dev->history_end;
   g_autofree gchar *snapshot_json = _live_snapshot_to_json(dev);
 
-  blend_payload.have_previous_opacity = TRUE;
-  blend_payload.previous_opacity = previous_opacity;
-  blend_payload.have_current_opacity = TRUE;
-  blend_payload.current_opacity = current_opacity;
+  if(request != NULL && request->have_opacity)
+  {
+    blend_payload.have_current_opacity = TRUE;
+    blend_payload.current_opacity = current_opacity;
+  }
+  if(request != NULL && request->have_blend_mode)
+  {
+    blend_payload.have_current_blend_mode = TRUE;
+    blend_payload.current_blend_mode = _live_snapshot_blend_mode_name(current_blend_mode);
+  }
+  if(request != NULL && request->have_reverse_order)
+  {
+    blend_payload.have_current_reverse_order = TRUE;
+    blend_payload.current_reverse_order = current_reverse_order;
+  }
   blend_payload.have_history = TRUE;
   blend_payload.history_before = history_before;
   blend_payload.history_after = history_after;
   _live_snapshot_add_module_blend(builder, &blend_payload);
 
-  if(fabs(current_opacity - requested_opacity) > 1e-6)
+  if((request != NULL && request->have_opacity && fabs(current_opacity - request->opacity) > 1e-6)
+     || (request != NULL && request->have_blend_mode && current_blend_mode != request->blend_mode)
+     || (request != NULL && request->have_reverse_order && current_reverse_order != request->reverse_order))
   {
     json_builder_set_member_name(builder, "reason");
     json_builder_add_string_value(builder, "module-blend-failed");
@@ -1636,9 +2086,15 @@ static int live_apply_module_instance_blend_cb(lua_State *L)
 {
   dt_develop_t *dev = darktable.develop;
   const gchar *instance_key = luaL_checkstring(L, 1);
-  const double requested_opacity = luaL_checknumber(L, 2);
+  const gchar *blend_json = luaL_checkstring(L, 2);
+  dt_live_module_blend_request_t request = { 0 };
+  if(!_live_parse_module_instance_blend_request(blend_json, &request))
+  {
+    return luaL_error(L, "invalid blend request");
+  }
+
   g_autofree gchar *response_json =
-    _live_apply_module_instance_blend_to_json(dev, instance_key, requested_opacity);
+    _live_apply_module_instance_blend_to_json(dev, instance_key, &request);
   lua_pushstring(L, response_json ? response_json : "{}");
   return 1;
 }

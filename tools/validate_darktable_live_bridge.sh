@@ -204,19 +204,41 @@ for item in module_stack:
         continue
     instance_key = item.get('instanceKey')
     opacity = blend.get('opacity')
+    blend_mode = blend.get('blendMode')
+    reverse_order = blend.get('reverseOrder')
+    blend_colorspace = blend.get('blendColorspace')
     if not isinstance(instance_key, str) or not instance_key:
         continue
     if not isinstance(opacity, (int, float)):
         continue
+    if not isinstance(blend_mode, str) or not blend_mode:
+        continue
+    if not isinstance(reverse_order, bool):
+        continue
+    if not isinstance(blend_colorspace, str) or not blend_colorspace:
+        continue
     target = requested
     if abs(target - opacity) <= 1e-6:
         target = 27.0 if abs(opacity - 27.0) > 1e-6 else 61.0
+    requested_blend_mode = 'multiply' if blend_mode != 'multiply' else 'normal'
+    invalid_blend_mode = {
+        'lab': 'divide',
+        'rgb-display': 'divide',
+        'rgb-scene': 'screen',
+        'raw': 'divide',
+    }.get(blend_colorspace)
     print(json.dumps({
-        'instanceKey': instance_key,
-        'moduleOp': item.get('moduleOp'),
-        'previousOpacity': opacity,
-        'requestedOpacity': target,
-    }, separators=(',', ':')))
+         'instanceKey': instance_key,
+         'moduleOp': item.get('moduleOp'),
+         'blendColorspace': blend_colorspace,
+         'previousOpacity': opacity,
+         'requestedOpacity': target,
+         'previousBlendMode': blend_mode,
+         'requestedBlendMode': requested_blend_mode,
+         'invalidBlendMode': invalid_blend_mode,
+         'previousReverseOrder': reverse_order,
+         'requestedReverseOrder': (not reverse_order),
+      }, separators=(',', ':')))
     break
 else:
     raise SystemExit('no blend-capable visible module available')
@@ -237,9 +259,40 @@ import json, sys
 print(json.loads(sys.argv[1])['previousOpacity'])
 PY
 )
-blend_apply_json=$(run_bridge apply-module-instance-blend "$blend_target_key" "{\"opacity\":$blend_requested_opacity}")
+blend_requested_mode=$(python3 - "$blend_target_json" <<'PY'
+import json, sys
+print(json.loads(sys.argv[1])['requestedBlendMode'])
+PY
+)
+blend_previous_mode=$(python3 - "$blend_target_json" <<'PY'
+import json, sys
+print(json.loads(sys.argv[1])['previousBlendMode'])
+PY
+)
+blend_invalid_mode=$(python3 - "$blend_target_json" <<'PY'
+import json, sys
+value = json.loads(sys.argv[1]).get('invalidBlendMode')
+print(value if isinstance(value, str) else '')
+PY
+)
+blend_requested_reverse=$(python3 - "$blend_target_json" <<'PY'
+import json, sys
+print('true' if json.loads(sys.argv[1])['requestedReverseOrder'] else 'false')
+PY
+)
+blend_previous_reverse=$(python3 - "$blend_target_json" <<'PY'
+import json, sys
+print('true' if json.loads(sys.argv[1])['previousReverseOrder'] else 'false')
+PY
+)
+blend_apply_json=$(run_bridge apply-module-instance-blend "$blend_target_key" "{\"opacity\":$blend_requested_opacity,\"blendMode\":\"$blend_requested_mode\",\"reverseOrder\":$blend_requested_reverse}")
 blend_followup_snapshot_json=$(run_bridge get-snapshot)
-blend_revert_json=$(run_bridge apply-module-instance-blend "$blend_target_key" "{\"opacity\":$blend_previous_opacity}")
+blend_revert_json=$(run_bridge apply-module-instance-blend "$blend_target_key" "{\"opacity\":$blend_previous_opacity,\"blendMode\":\"$blend_previous_mode\",\"reverseOrder\":$blend_previous_reverse}")
+if [[ -n "$blend_invalid_mode" ]]; then
+  invalid_blend_mode_json=$(run_bridge apply-module-instance-blend "$blend_target_key" "{\"blendMode\":\"$blend_invalid_mode\"}")
+else
+  invalid_blend_mode_json='{"status":"skipped","reason":"no-invalid-blend-mode-for-target"}'
+fi
 unsupported_blend_target_json=$(python3 - "$snapshot_json" <<'PY'
 import json, sys
 snapshot = json.loads(sys.argv[1])
@@ -668,7 +721,7 @@ if run_bridge apply-module-instance-blend "$blend_target_key" '{"opacity":"bad"}
 fi
 
 if run_bridge apply-module-instance-blend "$blend_target_key" '{}' >/dev/null 2>&1; then
-  fail "apply-module-instance-blend accepted missing opacity"
+  fail "apply-module-instance-blend accepted missing mutation fields"
 fi
 
 if run_bridge apply-module-instance-blend "$blend_target_key" '{"opacity":50,"extra":true}' >/dev/null 2>&1; then
@@ -677,6 +730,18 @@ fi
 
 if run_bridge apply-module-instance-blend "$blend_target_key" '{"opacity":101}' >/dev/null 2>&1; then
   fail "apply-module-instance-blend accepted out-of-range opacity"
+fi
+
+if run_bridge apply-module-instance-blend "$blend_target_key" '{"blendMode":7}' >/dev/null 2>&1; then
+  fail "apply-module-instance-blend accepted non-string blendMode"
+fi
+
+if run_bridge apply-module-instance-blend "$blend_target_key" '{"blendMode":"not-a-real-mode"}' >/dev/null 2>&1; then
+  fail "apply-module-instance-blend accepted unknown blendMode"
+fi
+
+if run_bridge apply-module-instance-blend "$blend_target_key" '{"reverseOrder":"bad"}' >/dev/null 2>&1; then
+  fail "apply-module-instance-blend accepted non-boolean reverseOrder"
 fi
 
 python3 - "$initial_json" "$snapshot_json" "$module_instance_target_json" "$list_json" "$get_control_json" "$set_json" "$post_set_exposure_json" "$set_control_json" "$post_set_control_json" "$unsupported_control_json" "$module_instance_action_json" "$module_instance_revert_json" "$module_instance_create_json" "$module_instance_duplicate_json" "$duplicate_result_target_json" "$duplicate_result_toggle_json" "$module_reorder_target_json" "$module_reorder_move_before_json" "$module_reorder_move_before_noop_json" "$module_reorder_move_after_json" "$unknown_anchor_module_reorder_json" "$module_delete_nonbase_target_json" "$module_delete_nonbase_json" "$post_delete_nonbase_snapshot_json" "$module_delete_target_json" "$module_delete_json" "$post_delete_snapshot_json" "$module_delete_blocked_target_json" "$module_delete_blocked_json" "$post_delete_blocked_snapshot_json" "$fence_blocked_module_reorder_json" "$rule_blocked_module_reorder_json" "$unsupported_module_action_json" "$unknown_module_instance_json" "$unsupported_view_snapshot_json" "$unsupported_view_get_control_json" "$unsupported_view_set_control_json" "$unsupported_view_module_instance_action_json" "$requested_exposure" "$requested_control_exposure" "$asset_path" <<'PY'
@@ -1200,7 +1265,7 @@ print('unsupported-view-apply-module-instance-action:', json.dumps(unsupported_v
 print('result: exposure controls and module-instance actions validated')
 PY
 
-python3 - "$snapshot_json" "$blend_target_json" "$blend_apply_json" "$blend_followup_snapshot_json" "$blend_revert_json" "$unsupported_blend_target_json" "$unsupported_blend_json" "$asset_path" <<'PY'
+python3 - "$snapshot_json" "$blend_target_json" "$blend_apply_json" "$blend_followup_snapshot_json" "$blend_revert_json" "$invalid_blend_mode_json" "$unsupported_blend_target_json" "$unsupported_blend_json" "$asset_path" <<'PY'
 import json, math, os, sys
 
 snapshot = json.loads(sys.argv[1])
@@ -1208,9 +1273,10 @@ blend_target = json.loads(sys.argv[2])
 blend_apply = json.loads(sys.argv[3])
 blend_followup = json.loads(sys.argv[4])
 blend_revert = json.loads(sys.argv[5])
-unsupported_target = json.loads(sys.argv[6])
-unsupported_blend = json.loads(sys.argv[7])
-asset = os.path.realpath(sys.argv[8])
+invalid_blend_mode = json.loads(sys.argv[6])
+unsupported_target = json.loads(sys.argv[7])
+unsupported_blend = json.loads(sys.argv[8])
+asset = os.path.realpath(sys.argv[9])
 
 def expect_close(name, value, target):
     if not isinstance(value, (int, float)) or math.isnan(value) or abs(value - target) > 1e-6:
@@ -1233,6 +1299,8 @@ def expect_blend_shape(name, item):
             raise SystemExit(f'{name} blendMode missing: {item}')
         if not isinstance(blend.get('reverseOrder'), bool):
             raise SystemExit(f'{name} reverseOrder missing: {item}')
+        if not isinstance(blend.get('blendColorspace'), str) or not blend.get('blendColorspace'):
+            raise SystemExit(f'{name} blendColorspace missing: {item}')
         if not isinstance(blend.get('opacity'), (int, float)):
             raise SystemExit(f'{name} opacity missing: {item}')
 
@@ -1246,6 +1314,10 @@ for index, item in enumerate(((snapshot.get('snapshot') or {}).get('historyItems
 target_key = blend_target.get('instanceKey')
 requested_opacity = blend_target.get('requestedOpacity')
 previous_opacity = blend_target.get('previousOpacity')
+requested_blend_mode = blend_target.get('requestedBlendMode')
+previous_blend_mode = blend_target.get('previousBlendMode')
+requested_reverse_order = blend_target.get('requestedReverseOrder')
+previous_reverse_order = blend_target.get('previousReverseOrder')
 if not isinstance(target_key, str) or not target_key:
     raise SystemExit(f'blend target missing instance key: {blend_target}')
 
@@ -1268,6 +1340,18 @@ if not isinstance(module_blend.get('multiName'), str):
 expect_close('blend apply previous opacity', module_blend.get('previousOpacity'), previous_opacity)
 expect_close('blend apply requested opacity', module_blend.get('requestedOpacity'), requested_opacity)
 expect_close('blend apply current opacity', module_blend.get('currentOpacity'), requested_opacity)
+if module_blend.get('previousBlendMode') != previous_blend_mode:
+    raise SystemExit(f'blend apply previous blend mode mismatch: {blend_apply}')
+if module_blend.get('requestedBlendMode') != requested_blend_mode:
+    raise SystemExit(f'blend apply requested blend mode mismatch: {blend_apply}')
+if module_blend.get('currentBlendMode') != requested_blend_mode:
+    raise SystemExit(f'blend apply current blend mode mismatch: {blend_apply}')
+if module_blend.get('previousReverseOrder') is not previous_reverse_order:
+    raise SystemExit(f'blend apply previous reverse order mismatch: {blend_apply}')
+if module_blend.get('requestedReverseOrder') is not requested_reverse_order:
+    raise SystemExit(f'blend apply requested reverse order mismatch: {blend_apply}')
+if module_blend.get('currentReverseOrder') is not requested_reverse_order:
+    raise SystemExit(f'blend apply current reverse order mismatch: {blend_apply}')
 if not isinstance(module_blend.get('historyBefore'), int) or not isinstance(module_blend.get('historyAfter'), int):
     raise SystemExit(f'blend apply history markers missing: {blend_apply}')
 if module_blend.get('requestedHistoryEnd') != module_blend.get('historyAfter'):
@@ -1277,15 +1361,28 @@ apply_items = module_items(blend_apply, target_key)
 if len(apply_items) != 1:
     raise SystemExit(f'blend apply snapshot missing target item: {blend_apply}')
 expect_close('blend apply snapshot opacity', (apply_items[0].get('blend') or {}).get('opacity'), requested_opacity)
+if (apply_items[0].get('blend') or {}).get('blendMode') != requested_blend_mode:
+    raise SystemExit(f'blend apply snapshot blend mode mismatch: {blend_apply}')
+if (apply_items[0].get('blend') or {}).get('reverseOrder') is not requested_reverse_order:
+    raise SystemExit(f'blend apply snapshot reverse order mismatch: {blend_apply}')
 
 followup_items = module_items(blend_followup, target_key)
 if len(followup_items) != 1:
     raise SystemExit(f'blend follow-up snapshot missing target item: {blend_followup}')
 expect_close('blend follow-up snapshot opacity', (followup_items[0].get('blend') or {}).get('opacity'), requested_opacity)
+if (followup_items[0].get('blend') or {}).get('blendMode') != requested_blend_mode:
+    raise SystemExit(f'blend follow-up snapshot blend mode mismatch: {blend_followup}')
+if (followup_items[0].get('blend') or {}).get('reverseOrder') is not requested_reverse_order:
+    raise SystemExit(f'blend follow-up snapshot reverse order mismatch: {blend_followup}')
 
 if blend_revert.get('status') != 'ok':
     raise SystemExit(f'blend revert failed: {blend_revert}')
-expect_close('blend revert current opacity', (blend_revert.get('moduleBlend') or {}).get('currentOpacity'), previous_opacity)
+revert_module_blend = blend_revert.get('moduleBlend') or {}
+expect_close('blend revert current opacity', revert_module_blend.get('currentOpacity'), previous_opacity)
+if revert_module_blend.get('currentBlendMode') != previous_blend_mode:
+    raise SystemExit(f'blend revert current blend mode mismatch: {blend_revert}')
+if revert_module_blend.get('currentReverseOrder') is not previous_reverse_order:
+    raise SystemExit(f'blend revert current reverse order mismatch: {blend_revert}')
 
 if unsupported_target.get('status') == 'found':
     if unsupported_blend.get('status') != 'unavailable' or unsupported_blend.get('reason') != 'unsupported-module-blend':
@@ -1296,9 +1393,26 @@ else:
     if unsupported_blend.get('status') != 'skipped':
         raise SystemExit(f'unsupported blend skip mismatch: {unsupported_blend}')
 
+if isinstance(blend_target.get('invalidBlendMode'), str) and blend_target.get('invalidBlendMode'):
+    if invalid_blend_mode.get('status') != 'unavailable' or invalid_blend_mode.get('reason') != 'unsupported-module-blend-mode':
+        raise SystemExit(f'invalid blend mode response mismatch: {invalid_blend_mode}')
+    invalid_module_blend = invalid_blend_mode.get('moduleBlend') or {}
+    if invalid_module_blend.get('targetInstanceKey') != target_key:
+        raise SystemExit(f'invalid blend mode target mismatch: {invalid_blend_mode}')
+    if invalid_module_blend.get('requestedBlendMode') != blend_target.get('invalidBlendMode'):
+        raise SystemExit(f'invalid blend mode requested mode mismatch: {invalid_blend_mode}')
+    if invalid_module_blend.get('currentBlendMode') != previous_blend_mode:
+        raise SystemExit(f'invalid blend mode current mode mismatch: {invalid_blend_mode}')
+    if invalid_module_blend.get('historyBefore') != invalid_module_blend.get('historyAfter'):
+        raise SystemExit(f'invalid blend mode history should stay unchanged: {invalid_blend_mode}')
+else:
+    if invalid_blend_mode.get('status') != 'skipped':
+        raise SystemExit(f'invalid blend mode skip mismatch: {invalid_blend_mode}')
+
 print('apply-module-instance-blend:', json.dumps(blend_apply, separators=(",", ":")))
 print('apply-module-instance-blend-followup:', json.dumps(blend_followup, separators=(",", ":")))
 print('apply-module-instance-blend-revert:', json.dumps(blend_revert, separators=(",", ":")))
+print('apply-module-instance-blend-invalid-mode:', json.dumps(invalid_blend_mode, separators=(",", ":")))
 print('apply-module-instance-blend-unsupported:', json.dumps(unsupported_blend, separators=(",", ":")))
-print('result: blend snapshot and opacity controls validated')
+print('result: blend snapshot and blend mutation controls validated')
 PY
