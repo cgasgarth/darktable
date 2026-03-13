@@ -240,6 +240,50 @@ post_set_control_json=$(wait_for_session_payload "$post_set_attempts" "$requeste
 unsupported_control_json=$(run_bridge get-control unsupported.control)
 module_instance_action_json=$(run_bridge apply-module-instance-action "$module_instance_key" "$module_instance_action")
 module_instance_revert_json=$(run_bridge apply-module-instance-action "$module_instance_key" "$module_instance_revert_action")
+module_instance_create_json=$(run_bridge apply-module-instance-action "$module_instance_key" create)
+module_instance_duplicate_json=$(run_bridge apply-module-instance-action "$module_instance_key" duplicate)
+duplicate_result_target_json=$(python3 - "$module_instance_duplicate_json" <<'PY'
+import json, sys
+payload = json.loads(sys.argv[1])
+action = payload.get('moduleAction') or {}
+snapshot = payload.get('snapshot') or {}
+result_key = action.get('resultInstanceKey')
+if not isinstance(result_key, str) or not result_key:
+    raise SystemExit('duplicate resultInstanceKey missing')
+module_stack = snapshot.get('moduleStack') or []
+result_item = None
+for item in module_stack:
+    if isinstance(item, dict) and item.get('instanceKey') == result_key:
+        result_item = item
+        break
+if result_item is None:
+    raise SystemExit('duplicate result snapshot item missing')
+enabled = result_item.get('enabled')
+if not isinstance(enabled, bool):
+    raise SystemExit('duplicate result enabled state missing')
+print(json.dumps({
+    'instanceKey': result_key,
+    'action': 'disable' if enabled else 'enable',
+    'previousEnabled': enabled,
+}, separators=(',', ':')))
+PY
+)
+duplicate_result_key=$(python3 - "$duplicate_result_target_json" <<'PY'
+import json, sys
+print(json.loads(sys.argv[1])['instanceKey'])
+PY
+)
+duplicate_result_action=$(python3 - "$duplicate_result_target_json" <<'PY'
+import json, sys
+print(json.loads(sys.argv[1])['action'])
+PY
+)
+duplicate_result_previous_enabled=$(python3 - "$duplicate_result_target_json" <<'PY'
+import json, sys
+print(json.loads(sys.argv[1])['previousEnabled'])
+PY
+)
+duplicate_result_toggle_json=$(run_bridge apply-module-instance-action "$duplicate_result_key" "$duplicate_result_action")
 unsupported_module_action_json=$(run_bridge apply-module-instance-action "$module_instance_key" unsupported-action)
 unknown_module_instance_json=$(run_bridge apply-module-instance-action unknown#-1#-1#missing enable)
 
@@ -263,7 +307,7 @@ if run_bridge set-exposure 4.5 >/dev/null 2>&1; then
   fail "set-exposure accepted out-of-range exposure"
 fi
 
-python3 - "$initial_json" "$snapshot_json" "$module_instance_target_json" "$list_json" "$get_control_json" "$set_json" "$post_set_exposure_json" "$set_control_json" "$post_set_control_json" "$unsupported_control_json" "$module_instance_action_json" "$module_instance_revert_json" "$unsupported_module_action_json" "$unknown_module_instance_json" "$unsupported_view_snapshot_json" "$unsupported_view_get_control_json" "$unsupported_view_set_control_json" "$unsupported_view_module_instance_action_json" "$requested_exposure" "$requested_control_exposure" "$asset_path" <<'PY'
+python3 - "$initial_json" "$snapshot_json" "$module_instance_target_json" "$list_json" "$get_control_json" "$set_json" "$post_set_exposure_json" "$set_control_json" "$post_set_control_json" "$unsupported_control_json" "$module_instance_action_json" "$module_instance_revert_json" "$module_instance_create_json" "$module_instance_duplicate_json" "$duplicate_result_target_json" "$duplicate_result_toggle_json" "$unsupported_module_action_json" "$unknown_module_instance_json" "$unsupported_view_snapshot_json" "$unsupported_view_get_control_json" "$unsupported_view_set_control_json" "$unsupported_view_module_instance_action_json" "$requested_exposure" "$requested_control_exposure" "$asset_path" <<'PY'
 import json, math, os, sys
 initial = json.loads(sys.argv[1])
 snapshot = json.loads(sys.argv[2])
@@ -277,15 +321,19 @@ post_set_control = json.loads(sys.argv[9])
 unsupported = json.loads(sys.argv[10])
 module_instance_action = json.loads(sys.argv[11])
 module_instance_revert = json.loads(sys.argv[12])
-unsupported_module_action = json.loads(sys.argv[13])
-unknown_module_instance = json.loads(sys.argv[14])
-unsupported_view_snapshot = json.loads(sys.argv[15])
-unsupported_view_get = json.loads(sys.argv[16])
-unsupported_view_set = json.loads(sys.argv[17])
-unsupported_view_module_instance_action = json.loads(sys.argv[18])
-requested = float(sys.argv[19])
-requested_control = float(sys.argv[20])
-asset = os.path.realpath(sys.argv[21])
+module_instance_create = json.loads(sys.argv[13])
+module_instance_duplicate = json.loads(sys.argv[14])
+duplicate_result_target = json.loads(sys.argv[15])
+duplicate_result_toggle = json.loads(sys.argv[16])
+unsupported_module_action = json.loads(sys.argv[17])
+unknown_module_instance = json.loads(sys.argv[18])
+unsupported_view_snapshot = json.loads(sys.argv[19])
+unsupported_view_get = json.loads(sys.argv[20])
+unsupported_view_set = json.loads(sys.argv[21])
+unsupported_view_module_instance_action = json.loads(sys.argv[22])
+requested = float(sys.argv[23])
+requested_control = float(sys.argv[24])
+asset = os.path.realpath(sys.argv[25])
 
 EXPECTED_CONTROL_ID = 'exposure.exposure'
 
@@ -339,6 +387,16 @@ def expect_snapshot_item(name, item, expect_index):
             raise SystemExit(f'{name} missing {key}: {item}')
     expect_params_shape(f'{name} params', item.get('params'))
 
+def read_param_value(item, path):
+    params = (item or {}).get('params') or {}
+    if params.get('encoding') != 'introspection-v1':
+        return None
+    fields = params.get('fields') or []
+    for field in fields:
+        if isinstance(field, dict) and field.get('path') == path:
+            return field.get('value')
+    return None
+
 def expect_module_instance_response(name, payload, target_key, action, expected_previous, expected_current):
     expect_ok(name, payload)
     action_payload = payload.get('moduleAction') or {}
@@ -363,6 +421,66 @@ def expect_module_instance_response(name, payload, target_key, action, expected_
         raise SystemExit(f'{name} history markers missing: {payload}')
     if action_payload.get('requestedHistoryEnd') != action_payload.get('historyAfter'):
         raise SystemExit(f'{name} requested history end mismatch: {payload}')
+
+def expect_module_instance_create_like_response(name, payload, target_key, action, source_module_op):
+    expect_ok(name, payload)
+    action_payload = payload.get('moduleAction') or {}
+    if action_payload.get('targetInstanceKey') != target_key:
+        raise SystemExit(f'{name} target instance mismatch: {payload}')
+    if action_payload.get('action') != action:
+        raise SystemExit(f'{name} action mismatch: {payload}')
+    result_key = action_payload.get('resultInstanceKey')
+    if not isinstance(result_key, str) or not result_key:
+        raise SystemExit(f'{name} result instance key missing: {payload}')
+    if result_key == target_key:
+        raise SystemExit(f'{name} result instance key did not change: {payload}')
+    if action_payload.get('moduleOp') != source_module_op:
+        raise SystemExit(f'{name} module op mismatch: {payload}')
+    if not isinstance(action_payload.get('iopOrder'), int):
+        raise SystemExit(f'{name} iopOrder missing: {payload}')
+    if not isinstance(action_payload.get('multiPriority'), int):
+        raise SystemExit(f'{name} multiPriority missing: {payload}')
+    if not isinstance(action_payload.get('multiName'), str):
+        raise SystemExit(f'{name} multiName missing: {payload}')
+    if not isinstance(action_payload.get('historyBefore'), int) or not isinstance(action_payload.get('historyAfter'), int):
+        raise SystemExit(f'{name} history markers missing: {payload}')
+    if action_payload.get('requestedHistoryEnd') != action_payload.get('historyAfter'):
+        raise SystemExit(f'{name} requested history end mismatch: {payload}')
+    if action_payload.get('historyAfter') < action_payload.get('historyBefore'):
+        raise SystemExit(f'{name} history did not advance: {payload}')
+
+    snapshot_payload = payload.get('snapshot') or {}
+    module_stack = snapshot_payload.get('moduleStack') or []
+    matching_items = [item for item in module_stack if isinstance(item, dict) and item.get('instanceKey') == result_key]
+    if len(matching_items) != 1:
+        raise SystemExit(f'{name} result snapshot item mismatch: {payload}')
+    result_item = matching_items[0]
+    if result_item.get('moduleOp') != source_module_op:
+        raise SystemExit(f'{name} snapshot module op mismatch: {payload}')
+    if result_item.get('iopOrder') != action_payload.get('iopOrder'):
+        raise SystemExit(f'{name} snapshot iopOrder mismatch: {payload}')
+    if result_item.get('multiPriority') != action_payload.get('multiPriority'):
+        raise SystemExit(f'{name} snapshot multiPriority mismatch: {payload}')
+    if result_item.get('multiName') != action_payload.get('multiName'):
+        raise SystemExit(f'{name} snapshot multiName mismatch: {payload}')
+    source_items = [item for item in module_stack if isinstance(item, dict) and item.get('instanceKey') == target_key]
+    if len(source_items) != 1:
+        raise SystemExit(f'{name} source snapshot item mismatch: {payload}')
+    sibling_items = [item for item in module_stack if isinstance(item, dict) and item.get('moduleOp') == source_module_op]
+    if len(sibling_items) < 2:
+        raise SystemExit(f'{name} module stack did not gain a sibling instance: {payload}')
+
+    source_item = source_items[0]
+    source_exposure = read_param_value(source_item, 'exposure')
+    result_exposure = read_param_value(result_item, 'exposure')
+    if action == 'duplicate':
+        if result_item.get('enabled') != source_item.get('enabled'):
+            raise SystemExit(f'{name} duplicate enabled state mismatch: {payload}')
+        if isinstance(source_exposure, (int, float)) and isinstance(result_exposure, (int, float)):
+            expect_close(f'{name} duplicate exposure copy', result_exposure, source_exposure)
+    elif action == 'create':
+        if isinstance(source_exposure, (int, float)) and isinstance(result_exposure, (int, float)) and abs(source_exposure - result_exposure) <= 1e-6:
+            raise SystemExit(f'{name} create exposure unexpectedly matches source params: {payload}')
 
 expect_ok('initial', initial)
 expect_ok('get-snapshot', snapshot)
@@ -447,6 +565,13 @@ module_target_current = (module_target_action == 'enable')
 module_target_revert_action = module_instance_target.get('revertAction')
 expect_module_instance_response('apply-module-instance-action', module_instance_action, module_target_key, module_target_action, module_target_previous, module_target_current)
 expect_module_instance_response('apply-module-instance-action revert', module_instance_revert, module_target_key, module_target_revert_action, module_target_current, module_target_previous)
+expect_module_instance_create_like_response('apply-module-instance-action create', module_instance_create, module_target_key, 'create', module_instance_target.get('moduleOp'))
+expect_module_instance_create_like_response('apply-module-instance-action duplicate', module_instance_duplicate, module_target_key, 'duplicate', module_instance_target.get('moduleOp'))
+duplicate_result_key = duplicate_result_target.get('instanceKey')
+duplicate_result_previous = duplicate_result_target.get('previousEnabled')
+duplicate_result_action = duplicate_result_target.get('action')
+duplicate_result_current = (duplicate_result_action == 'enable')
+expect_module_instance_response('apply-module-instance-action duplicate-result-toggle', duplicate_result_toggle, duplicate_result_key, duplicate_result_action, duplicate_result_previous, duplicate_result_current)
 if unsupported_module_action.get('status') != 'unavailable' or unsupported_module_action.get('reason') != 'unsupported-module-action':
     raise SystemExit(f'unsupported module action response mismatch: {unsupported_module_action}')
 if (unsupported_module_action.get('moduleAction') or {}).get('targetInstanceKey') != module_target_key:
@@ -469,6 +594,9 @@ print('set-control:', json.dumps(set_control, separators=(",", ":")))
 print('post-set-control:', json.dumps(post_set_control, separators=(",", ":")))
 print('apply-module-instance-action:', json.dumps(module_instance_action, separators=(",", ":")))
 print('apply-module-instance-action-revert:', json.dumps(module_instance_revert, separators=(",", ":")))
+print('apply-module-instance-action-create:', json.dumps(module_instance_create, separators=(",", ":")))
+print('apply-module-instance-action-duplicate:', json.dumps(module_instance_duplicate, separators=(",", ":")))
+print('apply-module-instance-action-duplicate-result-toggle:', json.dumps(duplicate_result_toggle, separators=(",", ":")))
 print('unsupported-module-action:', json.dumps(unsupported_module_action, separators=(",", ":")))
 print('unknown-module-instance:', json.dumps(unknown_module_instance, separators=(",", ":")))
 print('unsupported-control:', json.dumps(unsupported, separators=(",", ":")))
@@ -476,5 +604,5 @@ print('unsupported-view-get-snapshot:', json.dumps(unsupported_view_snapshot, se
 print('unsupported-view-get-control:', json.dumps(unsupported_view_get, separators=(",", ":")))
 print('unsupported-view-set-control:', json.dumps(unsupported_view_set, separators=(",", ":")))
 print('unsupported-view-apply-module-instance-action:', json.dumps(unsupported_view_module_instance_action, separators=(",", ":")))
-print('result: exposure controls and module-instance enable/disable actions validated')
+print('result: exposure controls and module-instance actions validated')
 PY
