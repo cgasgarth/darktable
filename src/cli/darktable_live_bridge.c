@@ -44,8 +44,9 @@ static void usage(FILE *stream, const char *progname)
           "  %s set-control <control-id> <value-json>\n"
           "  %s set-exposure <EV>\n"
           "  %s apply-module-instance-action <instance-key> <action>\n"
+          "  %s apply-module-instance-action <instance-key> <move-before|move-after> <anchor-instance-key>\n"
           "  %s --help\n",
-          progname, progname, progname, progname, progname, progname, progname, progname);
+          progname, progname, progname, progname, progname, progname, progname, progname, progname);
 }
 
 static gboolean print_json_only(const gchar *json, GError **error)
@@ -173,6 +174,7 @@ static gboolean validate_exposure_value(const double value, const gchar *label, 
 
 static gchar *build_lua_command(const gchar *command, const gchar *control_id,
                                 const gchar *instance_key, const gchar *module_action,
+                                const gchar *anchor_instance_key,
                                 gboolean have_numeric_value, double numeric_value)
 {
   const char *lua_template =
@@ -582,16 +584,16 @@ static gchar *build_lua_command(const gchar *command, const gchar *control_id,
      "    return response\n"
      "  end\n"
      "\n"
-     "  local function apply_module_instance_action(instance_key, action)\n"
-     "    local darkroom = darktable.gui.views.darkroom\n"
-     "    local response_json = darkroom and darkroom.live_apply_module_instance_action\n"
-     "      and darkroom.live_apply_module_instance_action(instance_key, action) or nil\n"
-     "    if type(response_json) ~= 'string' or response_json == '' then\n"
-     "      return json_encode({\n"
-     "        bridgeVersion = bridge.bridgeVersion,\n"
-     "        moduleAction = { action = action, targetInstanceKey = instance_key },\n"
-     "        reason = 'unsupported-module-state',\n"
-     "        session = session_object(),\n"
+      "  local function apply_module_instance_action(instance_key, action, anchor_instance_key)\n"
+      "    local darkroom = darktable.gui.views.darkroom\n"
+      "    local response_json = darkroom and darkroom.live_apply_module_instance_action\n"
+      "      and darkroom.live_apply_module_instance_action(instance_key, action, anchor_instance_key) or nil\n"
+      "    if type(response_json) ~= 'string' or response_json == '' then\n"
+      "      return json_encode({\n"
+      "        bridgeVersion = bridge.bridgeVersion,\n"
+      "        moduleAction = { action = action, anchorInstanceKey = anchor_instance_key, targetInstanceKey = instance_key },\n"
+      "        reason = 'unsupported-module-state',\n"
+      "        session = session_object(),\n"
      "        status = 'unavailable'\n"
      "      })\n"
      "    end\n"
@@ -653,10 +655,11 @@ static gchar *build_lua_command(const gchar *command, const gchar *control_id,
      "end\n"
      "\n"
      "local command = %s\n"
-     "local control_id = %s\n"
-     "local instance_key = %s\n"
-     "local module_action = %s\n"
-     "local numeric_value = %s\n"
+      "local control_id = %s\n"
+      "local instance_key = %s\n"
+      "local module_action = %s\n"
+      "local anchor_instance_key = %s\n"
+      "local numeric_value = %s\n"
      "local response\n"
      "if command == 'get-session' then\n"
      "  response = bridge.get_session()\n"
@@ -668,11 +671,11 @@ static gchar *build_lua_command(const gchar *command, const gchar *control_id,
     "  response = bridge.get_control(control_id)\n"
     "elseif command == 'set-control' then\n"
      "  response = bridge.set_control(control_id, numeric_value)\n"
-     "elseif command == 'set-exposure' then\n"
-     "  response = bridge.set_exposure(numeric_value)\n"
-     "elseif command == 'apply-module-instance-action' then\n"
-     "  return bridge.apply_module_instance_action(instance_key, module_action)\n"
-     "else\n"
+      "elseif command == 'set-exposure' then\n"
+      "  response = bridge.set_exposure(numeric_value)\n"
+      "elseif command == 'apply-module-instance-action' then\n"
+      "  return bridge.apply_module_instance_action(instance_key, module_action, anchor_instance_key)\n"
+      "else\n"
      "  error('unknown command: ' .. tostring(command))\n"
     "end\n"
     "return bridge.json_encode(response)\n";
@@ -682,6 +685,8 @@ static gchar *build_lua_command(const gchar *command, const gchar *control_id,
   g_autofree gchar *instance_literal = instance_key != NULL ? lua_string_literal(instance_key) : g_strdup("nil");
   g_autofree gchar *module_action_literal =
     module_action != NULL ? lua_string_literal(module_action) : g_strdup("nil");
+  g_autofree gchar *anchor_instance_literal =
+    anchor_instance_key != NULL ? lua_string_literal(anchor_instance_key) : g_strdup("nil");
   const char *numeric_literal = "nil";
   gchar numeric_buffer[G_ASCII_DTOSTR_BUF_SIZE] = { 0 };
 
@@ -692,7 +697,7 @@ static gchar *build_lua_command(const gchar *command, const gchar *control_id,
   }
 
   return g_strdup_printf(lua_template, command_literal, control_literal, instance_literal,
-                         module_action_literal, numeric_literal);
+                         module_action_literal, anchor_instance_literal, numeric_literal);
 }
 
 int main(int argc, char **argv)
@@ -709,6 +714,7 @@ int main(int argc, char **argv)
   const gchar *control_id = NULL;
   const gchar *instance_key = NULL;
   const gchar *module_action = NULL;
+  const gchar *anchor_instance_key = NULL;
   gboolean have_numeric_value = FALSE;
   double numeric_value = 0.0;
 
@@ -781,11 +787,26 @@ int main(int argc, char **argv)
     command = "set-exposure";
     have_numeric_value = TRUE;
   }
-  else if(argc == 4 && !strcmp(argv[1], "apply-module-instance-action"))
+  else if((argc == 4 || argc == 5) && !strcmp(argv[1], "apply-module-instance-action"))
   {
     command = "apply-module-instance-action";
     instance_key = argv[2];
     module_action = argv[3];
+
+    if(argc == 5)
+    {
+      if(strcmp(module_action, "move-before") && strcmp(module_action, "move-after"))
+      {
+        usage(stderr, progname);
+        return 1;
+      }
+      anchor_instance_key = argv[4];
+    }
+    else if(!strcmp(module_action, "move-before") || !strcmp(module_action, "move-after"))
+    {
+      usage(stderr, progname);
+      return 1;
+    }
   }
   else
   {
@@ -794,7 +815,8 @@ int main(int argc, char **argv)
   }
 
   g_autofree gchar *lua_source =
-    build_lua_command(command, control_id, instance_key, module_action, have_numeric_value, numeric_value);
+    build_lua_command(command, control_id, instance_key, module_action, anchor_instance_key,
+                      have_numeric_value, numeric_value);
   if(lua_source == NULL)
   {
     fprintf(stderr, "failed to build Lua command\n");
