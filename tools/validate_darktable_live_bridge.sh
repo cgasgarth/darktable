@@ -210,6 +210,7 @@ revert = 'enable' if action == 'disable' else 'disable'
 print(json.dumps({
     'instanceKey': target['instanceKey'],
     'moduleOp': target.get('moduleOp'),
+    'multiPriority': target.get('multiPriority'),
     'previousEnabled': target['enabled'],
     'action': action,
     'revertAction': revert,
@@ -314,9 +315,180 @@ PY
 module_reorder_move_before_json=$(run_bridge apply-module-instance-action "$module_reorder_target_key" move-before "$module_reorder_anchor_key")
 module_reorder_move_before_noop_json=$(run_bridge apply-module-instance-action "$module_reorder_target_key" move-before "$module_reorder_anchor_key")
 module_reorder_move_after_json=$(run_bridge apply-module-instance-action "$module_reorder_target_key" move-after "$module_reorder_anchor_key")
+post_reorder_snapshot_json=$(run_bridge get-snapshot)
 unknown_anchor_module_reorder_json=$(run_bridge apply-module-instance-action "$module_reorder_target_key" move-before unknown#-1#-1#missing-anchor)
 unsupported_module_action_json=$(run_bridge apply-module-instance-action "$module_instance_key" unsupported-action)
 unknown_module_instance_json=$(run_bridge apply-module-instance-action unknown#-1#-1#missing enable)
+module_delete_nonbase_target_json=$(python3 - "$post_reorder_snapshot_json" "$module_instance_target_json" <<'PY'
+import json, sys
+
+duplicate_payload = json.loads(sys.argv[1])
+source_payload = json.loads(sys.argv[2])
+snapshot = (duplicate_payload.get('snapshot') or {})
+module_stack = snapshot.get('moduleStack') or []
+source_key = source_payload.get('instanceKey')
+source_op = source_payload.get('moduleOp')
+
+if not isinstance(source_key, str) or not source_key:
+    raise SystemExit('missing source instance key for delete test')
+if not isinstance(source_op, str) or not source_op:
+    raise SystemExit('missing source module op for delete test')
+
+def family_instance(key):
+    parts = key.split('#', 3)
+    if len(parts) != 4:
+        raise SystemExit(f'invalid instance key: {key}')
+    return parts[1]
+
+source_instance = family_instance(source_key)
+siblings = []
+for item in module_stack:
+    if not isinstance(item, dict):
+        continue
+    key = item.get('instanceKey')
+    if not isinstance(key, str) or not key:
+        continue
+    if item.get('moduleOp') != source_op:
+        continue
+    if family_instance(key) != source_instance:
+        continue
+    siblings.append(item)
+
+if len(siblings) < 2:
+    raise SystemExit('delete test requires at least two visible family instances')
+
+target = None
+replacement_hint = None
+for item in siblings:
+    if item.get('multiPriority') != 0:
+        target = item
+        break
+if target is None:
+    raise SystemExit('delete test could not find non-base instance to delete')
+
+print(json.dumps({
+    'instanceKey': target['instanceKey'],
+    'moduleOp': target.get('moduleOp'),
+    'iopOrder': target.get('iopOrder'),
+    'multiPriority': target.get('multiPriority'),
+    'multiName': target.get('multiName'),
+    'familyInstance': source_instance,
+    'familyVisibleCount': len(siblings),
+}, separators=(',', ':')))
+PY
+)
+module_delete_nonbase_target_key=$(python3 - "$module_delete_nonbase_target_json" <<'PY'
+import json, sys
+print(json.loads(sys.argv[1])['instanceKey'])
+PY
+)
+module_delete_nonbase_json=$(run_bridge apply-module-instance-action "$module_delete_nonbase_target_key" delete)
+post_delete_nonbase_snapshot_json=$(run_bridge get-snapshot)
+module_delete_target_json=$(python3 - "$post_delete_nonbase_snapshot_json" "$module_instance_target_json" <<'PY'
+import json, sys
+
+snapshot = json.loads(sys.argv[1])
+source_payload = json.loads(sys.argv[2])
+module_stack = ((snapshot.get('snapshot') or {}).get('moduleStack') or [])
+source_key = source_payload.get('instanceKey')
+source_op = source_payload.get('moduleOp')
+
+if not isinstance(source_key, str) or not source_key:
+    raise SystemExit('missing source instance key for base delete test')
+if not isinstance(source_op, str) or not source_op:
+    raise SystemExit('missing source module op for base delete test')
+
+def family_instance(key):
+    parts = key.split('#', 3)
+    if len(parts) != 4:
+        raise SystemExit(f'invalid instance key: {key}')
+    return parts[1]
+
+source_instance = family_instance(source_key)
+siblings = []
+for item in module_stack:
+    if not isinstance(item, dict):
+        continue
+    key = item.get('instanceKey')
+    if not isinstance(key, str) or not key:
+        continue
+    if item.get('moduleOp') != source_op:
+        continue
+    if family_instance(key) != source_instance:
+        continue
+    siblings.append(item)
+
+if len(siblings) < 2:
+    raise SystemExit('base delete test requires at least two visible family instances after non-base delete')
+
+target = None
+for item in siblings:
+    if item.get('multiPriority') == 0:
+        target = item
+        break
+if target is None:
+    raise SystemExit('base delete test could not find base instance to delete')
+
+replacement_hint = None
+for item in siblings:
+    if item.get('instanceKey') != target.get('instanceKey'):
+        replacement_hint = item
+        break
+
+if replacement_hint is None:
+    raise SystemExit('base delete test could not find replacement hint instance')
+
+print(json.dumps({
+    'instanceKey': target['instanceKey'],
+    'moduleOp': target.get('moduleOp'),
+    'iopOrder': target.get('iopOrder'),
+    'multiPriority': target.get('multiPriority'),
+    'multiName': target.get('multiName'),
+    'familyInstance': source_instance,
+    'familyVisibleCount': len(siblings),
+    'replacementHintKey': replacement_hint['instanceKey'],
+}, separators=(',', ':')))
+PY
+)
+module_delete_target_key=$(python3 - "$module_delete_target_json" <<'PY'
+import json, sys
+print(json.loads(sys.argv[1])['instanceKey'])
+PY
+)
+module_delete_json=$(run_bridge apply-module-instance-action "$module_delete_target_key" delete)
+post_delete_snapshot_json=$(run_bridge get-snapshot)
+module_delete_blocked_target_json=$(python3 - "$post_delete_snapshot_json" "$module_delete_json" <<'PY'
+import json, sys
+
+snapshot = json.loads(sys.argv[1])
+delete_payload = json.loads(sys.argv[2])
+module_stack = ((snapshot.get('snapshot') or {}).get('moduleStack') or [])
+replacement_key = ((delete_payload.get('moduleAction') or {}).get('replacementInstanceKey'))
+
+if not isinstance(replacement_key, str) or not replacement_key:
+    raise SystemExit('missing replacementInstanceKey for blocked delete test')
+
+for item in module_stack:
+    if isinstance(item, dict) and item.get('instanceKey') == replacement_key:
+        print(json.dumps({
+            'instanceKey': item['instanceKey'],
+            'moduleOp': item.get('moduleOp'),
+            'iopOrder': item.get('iopOrder'),
+            'multiPriority': item.get('multiPriority'),
+            'multiName': item.get('multiName'),
+        }, separators=(',', ':')))
+        break
+else:
+    raise SystemExit('replacement instance missing from post-delete snapshot for blocked delete test')
+PY
+)
+module_delete_blocked_target_key=$(python3 - "$module_delete_blocked_target_json" <<'PY'
+import json, sys
+print(json.loads(sys.argv[1])['instanceKey'])
+PY
+)
+module_delete_blocked_json=$(run_bridge apply-module-instance-action "$module_delete_blocked_target_key" delete)
+post_delete_blocked_snapshot_json=$(run_bridge get-snapshot)
 fence_blocked_module_reorder_json=$(python3 - "$snapshot_json" "$bridge_bin" <<'PY'
 import json, subprocess, sys
 
@@ -406,7 +578,7 @@ if run_bridge set-exposure 4.5 >/dev/null 2>&1; then
   fail "set-exposure accepted out-of-range exposure"
 fi
 
-python3 - "$initial_json" "$snapshot_json" "$module_instance_target_json" "$list_json" "$get_control_json" "$set_json" "$post_set_exposure_json" "$set_control_json" "$post_set_control_json" "$unsupported_control_json" "$module_instance_action_json" "$module_instance_revert_json" "$module_instance_create_json" "$module_instance_duplicate_json" "$duplicate_result_target_json" "$duplicate_result_toggle_json" "$module_reorder_target_json" "$module_reorder_move_before_json" "$module_reorder_move_before_noop_json" "$module_reorder_move_after_json" "$unknown_anchor_module_reorder_json" "$fence_blocked_module_reorder_json" "$rule_blocked_module_reorder_json" "$unsupported_module_action_json" "$unknown_module_instance_json" "$unsupported_view_snapshot_json" "$unsupported_view_get_control_json" "$unsupported_view_set_control_json" "$unsupported_view_module_instance_action_json" "$requested_exposure" "$requested_control_exposure" "$asset_path" <<'PY'
+python3 - "$initial_json" "$snapshot_json" "$module_instance_target_json" "$list_json" "$get_control_json" "$set_json" "$post_set_exposure_json" "$set_control_json" "$post_set_control_json" "$unsupported_control_json" "$module_instance_action_json" "$module_instance_revert_json" "$module_instance_create_json" "$module_instance_duplicate_json" "$duplicate_result_target_json" "$duplicate_result_toggle_json" "$module_reorder_target_json" "$module_reorder_move_before_json" "$module_reorder_move_before_noop_json" "$module_reorder_move_after_json" "$unknown_anchor_module_reorder_json" "$module_delete_nonbase_target_json" "$module_delete_nonbase_json" "$post_delete_nonbase_snapshot_json" "$module_delete_target_json" "$module_delete_json" "$post_delete_snapshot_json" "$module_delete_blocked_target_json" "$module_delete_blocked_json" "$post_delete_blocked_snapshot_json" "$fence_blocked_module_reorder_json" "$rule_blocked_module_reorder_json" "$unsupported_module_action_json" "$unknown_module_instance_json" "$unsupported_view_snapshot_json" "$unsupported_view_get_control_json" "$unsupported_view_set_control_json" "$unsupported_view_module_instance_action_json" "$requested_exposure" "$requested_control_exposure" "$asset_path" <<'PY'
 import json, math, os, sys
 initial = json.loads(sys.argv[1])
 snapshot = json.loads(sys.argv[2])
@@ -429,17 +601,26 @@ module_reorder_move_before = json.loads(sys.argv[18])
 module_reorder_move_before_noop = json.loads(sys.argv[19])
 module_reorder_move_after = json.loads(sys.argv[20])
 unknown_anchor_module_reorder = json.loads(sys.argv[21])
-fence_blocked_module_reorder = json.loads(sys.argv[22])
-rule_blocked_module_reorder = json.loads(sys.argv[23])
-unsupported_module_action = json.loads(sys.argv[24])
-unknown_module_instance = json.loads(sys.argv[25])
-unsupported_view_snapshot = json.loads(sys.argv[26])
-unsupported_view_get = json.loads(sys.argv[27])
-unsupported_view_set = json.loads(sys.argv[28])
-unsupported_view_module_instance_action = json.loads(sys.argv[29])
-requested = float(sys.argv[30])
-requested_control = float(sys.argv[31])
-asset = os.path.realpath(sys.argv[32])
+module_delete_nonbase_target = json.loads(sys.argv[22])
+module_delete_nonbase = json.loads(sys.argv[23])
+post_delete_nonbase_snapshot = json.loads(sys.argv[24])
+module_delete_target = json.loads(sys.argv[25])
+module_delete = json.loads(sys.argv[26])
+post_delete_snapshot = json.loads(sys.argv[27])
+module_delete_blocked_target = json.loads(sys.argv[28])
+module_delete_blocked = json.loads(sys.argv[29])
+post_delete_blocked_snapshot = json.loads(sys.argv[30])
+fence_blocked_module_reorder = json.loads(sys.argv[31])
+rule_blocked_module_reorder = json.loads(sys.argv[32])
+unsupported_module_action = json.loads(sys.argv[33])
+unknown_module_instance = json.loads(sys.argv[34])
+unsupported_view_snapshot = json.loads(sys.argv[35])
+unsupported_view_get = json.loads(sys.argv[36])
+unsupported_view_set = json.loads(sys.argv[37])
+unsupported_view_module_instance_action = json.loads(sys.argv[38])
+requested = float(sys.argv[39])
+requested_control = float(sys.argv[40])
+asset = os.path.realpath(sys.argv[41])
 
 EXPECTED_CONTROL_ID = 'exposure.exposure'
 
@@ -641,6 +822,124 @@ def expect_reorder_unavailable(name, payload, target_key, anchor_key, action, re
     if action_payload.get('action') != action:
         raise SystemExit(f'{name} action mismatch: {payload}')
 
+def expect_module_delete_response(name, payload, latest_snapshot, target, blocked=False, expected_snapshot=None):
+    action_payload = payload.get('moduleAction') or {}
+    target_key = target.get('instanceKey')
+    if action_payload.get('targetInstanceKey') != target_key:
+        raise SystemExit(f'{name} target instance mismatch: {payload}')
+    if action_payload.get('action') != 'delete':
+        raise SystemExit(f'{name} action mismatch: {payload}')
+    if action_payload.get('moduleOp') != target.get('moduleOp'):
+        raise SystemExit(f'{name} module op mismatch: {payload}')
+    if action_payload.get('iopOrder') != target.get('iopOrder'):
+        raise SystemExit(f'{name} iopOrder mismatch: {payload}')
+    if action_payload.get('multiPriority') != target.get('multiPriority'):
+        raise SystemExit(f'{name} multiPriority mismatch: {payload}')
+    if action_payload.get('multiName') != target.get('multiName'):
+        raise SystemExit(f'{name} multiName mismatch: {payload}')
+    if not isinstance(action_payload.get('historyBefore'), int) or not isinstance(action_payload.get('historyAfter'), int):
+        raise SystemExit(f'{name} history markers missing: {payload}')
+    if action_payload.get('requestedHistoryEnd') != action_payload.get('historyAfter'):
+        raise SystemExit(f'{name} requested history end mismatch: {payload}')
+
+    if blocked:
+        if payload.get('status') != 'unavailable' or payload.get('reason') != 'module-delete-blocked-last-instance':
+            raise SystemExit(f'{name} response mismatch: {payload}')
+        if action_payload.get('historyBefore') != action_payload.get('historyAfter'):
+            raise SystemExit(f'{name} blocked delete unexpectedly changed history: {payload}')
+        expect_ok(f'{name} fresh snapshot', latest_snapshot)
+        latest_snapshot_payload = latest_snapshot.get('snapshot') or {}
+        if latest_snapshot_payload.get('appliedHistoryEnd') != action_payload.get('requestedHistoryEnd'):
+            raise SystemExit(f'{name} blocked delete changed appliedHistoryEnd: {latest_snapshot}')
+        if isinstance(expected_snapshot, dict) and latest_snapshot_payload != expected_snapshot:
+            raise SystemExit(f'{name} blocked delete changed snapshot contents: {latest_snapshot}')
+        latest_module_stack = latest_snapshot_payload.get('moduleStack') or []
+        latest_history_items = latest_snapshot_payload.get('historyItems') or []
+        if not any(isinstance(item, dict) and item.get('instanceKey') == target_key for item in latest_module_stack):
+            raise SystemExit(f'{name} blocked delete lost target from moduleStack: {latest_snapshot}')
+        if not any(isinstance(item, dict) and item.get('instanceKey') == target_key for item in latest_history_items):
+            raise SystemExit(f'{name} blocked delete lost target from historyItems: {latest_snapshot}')
+        return
+
+    expect_ok(name, payload)
+    if action_payload.get('historyAfter') >= action_payload.get('historyBefore'):
+        raise SystemExit(f'{name} delete did not shrink history: {payload}')
+
+    snapshot_payload = payload.get('snapshot') or {}
+    if snapshot_payload.get('appliedHistoryEnd') != action_payload.get('requestedHistoryEnd'):
+        raise SystemExit(f'{name} embedded snapshot history end mismatch: {payload}')
+    module_stack = snapshot_payload.get('moduleStack') or []
+    history_items = snapshot_payload.get('historyItems') or []
+    if any(isinstance(item, dict) and item.get('instanceKey') == target_key for item in module_stack):
+        raise SystemExit(f'{name} deleted target still present in snapshot: {payload}')
+    if any(isinstance(item, dict) and item.get('instanceKey') == target_key for item in history_items):
+        raise SystemExit(f'{name} deleted target still present in historyItems: {payload}')
+
+    expect_ok(f'{name} fresh snapshot', latest_snapshot)
+    latest_snapshot_payload = latest_snapshot.get('snapshot') or {}
+    latest_module_stack = latest_snapshot_payload.get('moduleStack') or []
+    latest_history_items = latest_snapshot_payload.get('historyItems') or []
+    if latest_snapshot_payload.get('appliedHistoryEnd') != action_payload.get('requestedHistoryEnd'):
+        raise SystemExit(f'{name} fresh snapshot history end mismatch: {latest_snapshot}')
+    if latest_snapshot_payload != snapshot_payload:
+        raise SystemExit(f'{name} embedded snapshot does not match fresh readback: {latest_snapshot}')
+    if any(isinstance(item, dict) and item.get('instanceKey') == target_key for item in latest_module_stack):
+        raise SystemExit(f'{name} deleted target still present in fresh moduleStack: {latest_snapshot}')
+    if any(isinstance(item, dict) and item.get('instanceKey') == target_key for item in latest_history_items):
+        raise SystemExit(f'{name} deleted target still present in fresh historyItems: {latest_snapshot}')
+
+    family_instance = target.get('familyInstance')
+    family_visible_count = target.get('familyVisibleCount')
+    if isinstance(family_instance, str) and isinstance(family_visible_count, int):
+        family_items = [
+            item for item in latest_module_stack
+            if isinstance(item, dict)
+            and item.get('moduleOp') == target.get('moduleOp')
+            and isinstance(item.get('instanceKey'), str)
+            and item['instanceKey'].split('#', 3)[1] == family_instance
+        ]
+        if len(family_items) != family_visible_count - 1:
+            raise SystemExit(f'{name} family size did not shrink by one: {latest_snapshot}')
+
+    replacement_key = action_payload.get('replacementInstanceKey')
+    if action_payload.get('multiPriority') == 0:
+        if not isinstance(replacement_key, str) or not replacement_key:
+            raise SystemExit(f'{name} replacementInstanceKey missing for base delete: {payload}')
+        replacement_parts = replacement_key.split('#', 3)
+        if len(replacement_parts) != 4:
+            raise SystemExit(f'{name} replacement key shape mismatch: {payload}')
+        family_instance = target.get('familyInstance')
+        if isinstance(family_instance, str) and family_instance and replacement_parts[1] != family_instance:
+            raise SystemExit(f'{name} replacement did not stay within the deleted module family: {payload}')
+        matching_replacements = [item for item in module_stack if isinstance(item, dict) and item.get('instanceKey') == replacement_key]
+        if len(matching_replacements) != 1:
+            raise SystemExit(f'{name} replacement snapshot item mismatch: {payload}')
+        replacement_item = matching_replacements[0]
+        if replacement_item.get('moduleOp') != target.get('moduleOp'):
+            raise SystemExit(f'{name} replacement module op mismatch: {payload}')
+        if action_payload.get('replacementIopOrder') != replacement_item.get('iopOrder'):
+            raise SystemExit(f'{name} replacement iopOrder mismatch: {payload}')
+        if action_payload.get('replacementMultiPriority') != replacement_item.get('multiPriority'):
+            raise SystemExit(f'{name} replacement multiPriority mismatch: {payload}')
+        if action_payload.get('replacementMultiName') != replacement_item.get('multiName'):
+            raise SystemExit(f'{name} replacement multiName mismatch: {payload}')
+        if replacement_item.get('multiPriority') != 0:
+            raise SystemExit(f'{name} replacement was not promoted to base priority: {payload}')
+        fresh_replacement_items = [item for item in latest_module_stack if isinstance(item, dict) and item.get('instanceKey') == replacement_key]
+        if len(fresh_replacement_items) != 1:
+            raise SystemExit(f'{name} replacement missing from fresh snapshot: {latest_snapshot}')
+        if not any(isinstance(item, dict) and item.get('instanceKey') == replacement_key for item in latest_history_items):
+            raise SystemExit(f'{name} replacement missing from fresh historyItems: {latest_snapshot}')
+        hint_key = target.get('replacementHintKey')
+        if isinstance(hint_key, str) and hint_key and replacement_key == target_key:
+            raise SystemExit(f'{name} replacement key repeated deleted target: {payload}')
+    elif replacement_key is not None:
+        matching_replacements = [item for item in module_stack if isinstance(item, dict) and item.get('instanceKey') == replacement_key]
+        if len(matching_replacements) != 1:
+            raise SystemExit(f'{name} optional replacement snapshot item mismatch: {payload}')
+        if not any(isinstance(item, dict) and item.get('instanceKey') == replacement_key for item in latest_module_stack):
+            raise SystemExit(f'{name} optional replacement missing from fresh snapshot: {latest_snapshot}')
+
 expect_ok('initial', initial)
 expect_ok('get-snapshot', snapshot)
 if listed.get('status') != 'ok':
@@ -737,6 +1036,16 @@ expect_module_reorder_response('apply-module-instance-action move-before', modul
 expect_reorder_unavailable('apply-module-instance-action move-before no-op', module_reorder_move_before_noop, module_reorder_target_key, module_reorder_anchor_key, 'move-before', 'module-reorder-no-op')
 expect_module_reorder_response('apply-module-instance-action move-after', module_reorder_move_after, module_reorder_target_key, module_reorder_anchor_key, 'move-after')
 expect_reorder_unavailable('apply-module-instance-action unknown-anchor', unknown_anchor_module_reorder, module_reorder_target_key, 'unknown#-1#-1#missing-anchor', 'move-before', 'unknown-anchor-instance-key')
+expect_module_delete_response('apply-module-instance-action delete-nonbase', module_delete_nonbase, post_delete_nonbase_snapshot, module_delete_nonbase_target)
+expect_module_delete_response('apply-module-instance-action delete', module_delete, post_delete_snapshot, module_delete_target)
+expect_module_delete_response(
+    'apply-module-instance-action delete-blocked-last-instance',
+    module_delete_blocked,
+    post_delete_blocked_snapshot,
+    module_delete_blocked_target,
+    blocked=True,
+    expected_snapshot=(post_delete_snapshot.get('snapshot') or {}),
+)
 if fence_blocked_module_reorder.get('status') != 'skipped':
     if fence_blocked_module_reorder.get('status') != 'unavailable' or fence_blocked_module_reorder.get('reason') != 'module-reorder-blocked-by-fence':
         raise SystemExit(f'apply-module-instance-action fence-blocked response mismatch: {fence_blocked_module_reorder}')
@@ -771,11 +1080,17 @@ print('apply-module-instance-action-duplicate-result-toggle:', json.dumps(duplic
 print('apply-module-instance-action-move-before:', json.dumps(module_reorder_move_before, separators=(",", ":")))
 print('apply-module-instance-action-move-before-noop:', json.dumps(module_reorder_move_before_noop, separators=(",", ":")))
 print('apply-module-instance-action-move-after:', json.dumps(module_reorder_move_after, separators=(",", ":")))
+print('apply-module-instance-action-delete-nonbase:', json.dumps(module_delete_nonbase, separators=(",", ":")))
+print('apply-module-instance-action-delete:', json.dumps(module_delete, separators=(",", ":")))
+print('apply-module-instance-action-delete-blocked-last-instance:', json.dumps(module_delete_blocked, separators=(",", ":")))
 print('unknown-anchor-module-reorder:', json.dumps(unknown_anchor_module_reorder, separators=(",", ":")))
 print('fence-blocked-module-reorder:', json.dumps(fence_blocked_module_reorder, separators=(",", ":")))
 print('rule-blocked-module-reorder:', json.dumps(rule_blocked_module_reorder, separators=(",", ":")))
 print('unsupported-module-action:', json.dumps(unsupported_module_action, separators=(",", ":")))
 print('unknown-module-instance:', json.dumps(unknown_module_instance, separators=(",", ":")))
+print('post-delete-nonbase-snapshot:', json.dumps(post_delete_nonbase_snapshot, separators=(",", ":")))
+print('post-delete-snapshot:', json.dumps(post_delete_snapshot, separators=(",", ":")))
+print('post-delete-blocked-snapshot:', json.dumps(post_delete_blocked_snapshot, separators=(",", ":")))
 print('unsupported-control:', json.dumps(unsupported, separators=(",", ":")))
 print('unsupported-view-get-snapshot:', json.dumps(unsupported_view_snapshot, separators=(",", ":")))
 print('unsupported-view-get-control:', json.dumps(unsupported_view_get, separators=(",", ":")))
