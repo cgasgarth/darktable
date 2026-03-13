@@ -492,6 +492,7 @@ typedef enum dt_live_module_instance_action_t
   DT_LIVE_MODULE_INSTANCE_ACTION_DISABLE,
   DT_LIVE_MODULE_INSTANCE_ACTION_CREATE,
   DT_LIVE_MODULE_INSTANCE_ACTION_DUPLICATE,
+  DT_LIVE_MODULE_INSTANCE_ACTION_DELETE,
   DT_LIVE_MODULE_INSTANCE_ACTION_MOVE_BEFORE,
   DT_LIVE_MODULE_INSTANCE_ACTION_MOVE_AFTER,
 } dt_live_module_instance_action_t;
@@ -505,6 +506,7 @@ typedef struct dt_live_module_action_payload_t
   gboolean requested_enabled;
   dt_iop_module_t *module;
   dt_iop_module_t *result_module;
+  dt_iop_module_t *replacement_module;
   gboolean have_previous_enabled;
   gboolean previous_enabled;
   gboolean have_current_enabled;
@@ -543,6 +545,8 @@ static dt_live_module_instance_action_t _live_module_instance_action_from_string
     return DT_LIVE_MODULE_INSTANCE_ACTION_CREATE;
   if(g_strcmp0(action, "duplicate") == 0)
     return DT_LIVE_MODULE_INSTANCE_ACTION_DUPLICATE;
+  if(g_strcmp0(action, "delete") == 0)
+    return DT_LIVE_MODULE_INSTANCE_ACTION_DELETE;
   if(g_strcmp0(action, "move-before") == 0)
     return DT_LIVE_MODULE_INSTANCE_ACTION_MOVE_BEFORE;
   if(g_strcmp0(action, "move-after") == 0)
@@ -608,6 +612,22 @@ static void _live_snapshot_add_module_action(JsonBuilder *builder,
       json_builder_set_member_name(builder, "multiName");
       json_builder_add_string_value(builder, payload->result_module->multi_name);
     }
+  }
+
+  if(payload != NULL && payload->replacement_module != NULL)
+  {
+    g_autofree gchar *replacement_instance_key =
+      _live_snapshot_instance_key(payload->replacement_module->op, payload->replacement_module->instance,
+                                  payload->replacement_module->multi_priority,
+                                  payload->replacement_module->multi_name);
+    json_builder_set_member_name(builder, "replacementInstanceKey");
+    json_builder_add_string_value(builder, replacement_instance_key);
+    json_builder_set_member_name(builder, "replacementIopOrder");
+    json_builder_add_int_value(builder, payload->replacement_module->iop_order);
+    json_builder_set_member_name(builder, "replacementMultiPriority");
+    json_builder_add_int_value(builder, payload->replacement_module->multi_priority);
+    json_builder_set_member_name(builder, "replacementMultiName");
+    json_builder_add_string_value(builder, payload->replacement_module->multi_name);
   }
 
   if(payload != NULL && payload->have_previous_enabled)
@@ -724,6 +744,116 @@ static dt_live_module_reorder_check_t _live_module_instance_check_reorder(dt_dev
   }
 
   return DT_LIVE_MODULE_REORDER_CHECK_OK;
+}
+
+static guint _live_module_visible_family_count(const dt_develop_t *dev, const dt_iop_module_t *module)
+{
+  if(dev == NULL || module == NULL) return 0;
+
+  guint count = 0;
+  for(const GList *iter = dev->iop; iter; iter = g_list_next(iter))
+  {
+    const dt_iop_module_t *candidate = iter->data;
+    if(candidate == NULL || dt_iop_is_hidden((dt_iop_module_t *)candidate)) continue;
+    if(candidate->instance == module->instance) count++;
+  }
+
+  return count;
+}
+
+static dt_iop_module_t *_live_module_delete_sibling(const dt_iop_module_t *module)
+{
+  if(module == NULL || module->dev == NULL) return NULL;
+
+  dt_iop_module_t *next = NULL;
+  gboolean found = FALSE;
+  for(const GList *modules = module->dev->iop; modules; modules = g_list_next(modules))
+  {
+    dt_iop_module_t *candidate = modules->data;
+    if(candidate == NULL || dt_iop_is_hidden(candidate)) continue;
+
+    if(candidate == module)
+    {
+      found = TRUE;
+      if(next != NULL) break;
+    }
+    else if(candidate->instance == module->instance)
+    {
+      next = candidate;
+      if(found) break;
+    }
+  }
+
+  return next;
+}
+
+static gboolean _live_delete_module_instance(dt_develop_t *dev,
+                                             dt_iop_module_t *module,
+                                             dt_iop_module_t **replacement_out)
+{
+  if(replacement_out != NULL) *replacement_out = NULL;
+  if(dev == NULL || module == NULL) return FALSE;
+
+  dt_iop_module_t *replacement = _live_module_delete_sibling(module);
+  dt_iop_module_t *replacement_for_response = NULL;
+  if(replacement == NULL) return FALSE;
+
+  if(dev->gui_attached)
+    DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_DEVELOP_HISTORY_WILL_CHANGE);
+
+  if(darktable.develop->gui_module == module)
+    dt_iop_request_focus(NULL);
+
+  const gboolean is_zero = (module->multi_priority == 0);
+
+  ++darktable.gui->reset;
+
+  if(!dt_iop_is_hidden(module))
+    dt_iop_gui_cleanup_module(module);
+
+  dt_dev_module_remove(dev, module);
+
+  if(is_zero)
+  {
+    dt_iop_module_t *first = NULL;
+    for(GList *history = dev->history; history; history = g_list_next(history))
+    {
+      dt_dev_history_item_t *hist = history->data;
+      if(hist->module != NULL && !dt_iop_is_hidden(hist->module)
+         && hist->module->instance == module->instance && hist->module != module)
+      {
+        first = hist->module;
+        break;
+      }
+    }
+    if(first == NULL) first = replacement;
+
+    if(first != NULL)
+    {
+      dt_iop_update_multi_priority(first, 0);
+      for(GList *history = dev->history; history; history = g_list_next(history))
+      {
+        dt_dev_history_item_t *hist = history->data;
+        if(hist->module == first) hist->multi_priority = 0;
+      }
+      replacement = first;
+      replacement_for_response = first;
+    }
+  }
+
+  if(dev->gui_attached)
+    DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_DEVELOP_HISTORY_CHANGE);
+
+  dt_iop_connect_accels_multi(module->so);
+  dt_action_cleanup_instance_iop(module);
+  dev->alliop = g_list_append(dev->alliop, module);
+  dt_dev_pixelpipe_rebuild(dev);
+  dt_control_queue_redraw_center();
+
+  --darktable.gui->reset;
+
+  if(replacement_out != NULL) *replacement_out = replacement_for_response;
+  return TRUE;
 }
 
 static const gchar *_live_module_instance_reorder_reason(const dt_live_module_reorder_check_t check)
@@ -924,6 +1054,63 @@ static gchar *_live_apply_module_instance_action_to_json(dt_develop_t *dev,
     _live_snapshot_add_module_action(builder, &action_payload);
 
     if(result_module == NULL)
+    {
+      json_builder_set_member_name(builder, "reason");
+      json_builder_add_string_value(builder, "module-action-failed");
+      json_builder_set_member_name(builder, "status");
+      json_builder_add_string_value(builder, "unavailable");
+      json_builder_end_object(builder);
+      return _live_json_builder_to_string(builder);
+    }
+
+    JsonNode *snapshot_root = _live_json_copy_object_root(snapshot_json);
+    if(snapshot_root == NULL)
+    {
+      json_builder_set_member_name(builder, "reason");
+      json_builder_add_string_value(builder, "snapshot-unavailable");
+      json_builder_set_member_name(builder, "status");
+      json_builder_add_string_value(builder, "unavailable");
+      json_builder_end_object(builder);
+      return _live_json_builder_to_string(builder);
+    }
+
+    json_builder_set_member_name(builder, "snapshot");
+    json_builder_add_value(builder, snapshot_root);
+    json_builder_set_member_name(builder, "status");
+    json_builder_add_string_value(builder, "ok");
+    json_builder_end_object(builder);
+    return _live_json_builder_to_string(builder);
+  }
+
+  if(action_kind == DT_LIVE_MODULE_INSTANCE_ACTION_DELETE)
+  {
+    action_payload.have_history = TRUE;
+    action_payload.history_before = history_before;
+    action_payload.history_after = history_before;
+
+    if(_live_module_visible_family_count(dev, module) <= 1)
+    {
+      _live_snapshot_add_module_action(builder, &action_payload);
+      json_builder_set_member_name(builder, "reason");
+      json_builder_add_string_value(builder, "module-delete-blocked-last-instance");
+      json_builder_set_member_name(builder, "status");
+      json_builder_add_string_value(builder, "unavailable");
+      json_builder_end_object(builder);
+      return _live_json_builder_to_string(builder);
+    }
+
+    dt_iop_module_t *replacement_module = NULL;
+    const gboolean deleted = _live_delete_module_instance(dev, module, &replacement_module);
+    const gint history_after = dev->history_end;
+    g_autofree gchar *snapshot_json = deleted ? _live_snapshot_to_json(dev) : NULL;
+
+    action_payload.replacement_module = replacement_module;
+    action_payload.have_history = TRUE;
+    action_payload.history_before = history_before;
+    action_payload.history_after = history_after;
+    _live_snapshot_add_module_action(builder, &action_payload);
+
+    if(!deleted)
     {
       json_builder_set_member_name(builder, "reason");
       json_builder_add_string_value(builder, "module-action-failed");
