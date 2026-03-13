@@ -32,6 +32,8 @@
 #define DT_LIVE_BRIDGE_CACHE_KEY "__darktable_live_bridge_v1_controls"
 #define DT_LIVE_BRIDGE_EXPOSURE_MIN -3.0
 #define DT_LIVE_BRIDGE_EXPOSURE_MAX 4.0
+#define DT_LIVE_BRIDGE_BLEND_OPACITY_MIN 0.0
+#define DT_LIVE_BRIDGE_BLEND_OPACITY_MAX 100.0
 
 static void usage(FILE *stream, const char *progname)
 {
@@ -45,8 +47,10 @@ static void usage(FILE *stream, const char *progname)
           "  %s set-exposure <EV>\n"
           "  %s apply-module-instance-action <instance-key> <action>\n"
           "  %s apply-module-instance-action <instance-key> <move-before|move-after> <anchor-instance-key>\n"
+          "  %s apply-module-instance-blend <instance-key> <blend-json>\n"
           "  %s --help\n",
-          progname, progname, progname, progname, progname, progname, progname, progname, progname);
+          progname, progname, progname, progname, progname, progname, progname, progname, progname,
+          progname);
 }
 
 static gboolean print_json_only(const gchar *json, GError **error)
@@ -158,6 +162,65 @@ static gboolean validate_json_literal(const gchar *json_text, GError **error)
 {
   g_autoptr(JsonParser) parser = json_parser_new();
   return json_parser_load_from_data(parser, json_text, -1, error);
+}
+
+static gboolean parse_blend_opacity_json(const gchar *json_text, double *opacity_out, GError **error)
+{
+  g_autoptr(JsonParser) parser = json_parser_new();
+  if(!json_parser_load_from_data(parser, json_text, -1, error)) return FALSE;
+
+  JsonNode *root = json_parser_get_root(parser);
+  if(root == NULL || !JSON_NODE_HOLDS_OBJECT(root))
+  {
+    g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
+                        "blend value must be a JSON object");
+    return FALSE;
+  }
+
+  JsonObject *object = json_node_get_object(root);
+  if(object == NULL || json_object_get_size(object) != 1 || !json_object_has_member(object, "opacity"))
+  {
+    g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
+                        "blend value must be exactly {\"opacity\":<number>}");
+    return FALSE;
+  }
+
+  JsonNode *opacity_node = json_object_get_member(object, "opacity");
+  if(opacity_node == NULL || !JSON_NODE_HOLDS_VALUE(opacity_node))
+  {
+    g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
+                        "blend opacity must be a JSON number");
+    return FALSE;
+  }
+
+  const GType value_type = json_node_get_value_type(opacity_node);
+  if(value_type != G_TYPE_DOUBLE && value_type != G_TYPE_INT64 && value_type != G_TYPE_INT
+     && value_type != G_TYPE_UINT64 && value_type != G_TYPE_UINT && value_type != G_TYPE_LONG
+     && value_type != G_TYPE_ULONG)
+  {
+    g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
+                        "blend opacity must be a JSON number");
+    return FALSE;
+  }
+
+  const double opacity = json_node_get_double(opacity_node);
+  if(!isfinite(opacity))
+  {
+    g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
+                        "blend opacity must be finite");
+    return FALSE;
+  }
+
+  if(opacity < DT_LIVE_BRIDGE_BLEND_OPACITY_MIN || opacity > DT_LIVE_BRIDGE_BLEND_OPACITY_MAX)
+  {
+    g_set_error(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
+                "blend opacity must be between %.0f and %.0f",
+                DT_LIVE_BRIDGE_BLEND_OPACITY_MIN, DT_LIVE_BRIDGE_BLEND_OPACITY_MAX);
+    return FALSE;
+  }
+
+  *opacity_out = opacity;
+  return TRUE;
 }
 
 static gboolean validate_exposure_value(const double value, const gchar *label, GError **error)
@@ -602,13 +665,37 @@ static gchar *build_lua_command(const gchar *command, const gchar *control_id,
      "      error('module action payload malformed')\n"
      "    end\n"
      "\n"
-     "    return '{'\n"
-     "      .. '\"bridgeVersion\":' .. json_encode(bridge.bridgeVersion)\n"
-     "      .. ',\"session\":' .. json_encode(session_object())\n"
-     "      .. ',' .. string.sub(response_json, 2)\n"
-     "  end\n"
-     "\n"
-     "  local function on_view_changed(_, _, new_view)\n"
+      "    return '{'\n"
+      "      .. '\"bridgeVersion\":' .. json_encode(bridge.bridgeVersion)\n"
+      "      .. ',\"session\":' .. json_encode(session_object())\n"
+      "      .. ',' .. string.sub(response_json, 2)\n"
+      "  end\n"
+      "\n"
+      "  local function apply_module_instance_blend(instance_key, opacity)\n"
+      "    local darkroom = darktable.gui.views.darkroom\n"
+      "    local response_json = darkroom and darkroom.live_apply_module_instance_blend\n"
+      "      and darkroom.live_apply_module_instance_blend(instance_key, opacity) or nil\n"
+      "    if type(response_json) ~= 'string' or response_json == '' then\n"
+      "      return json_encode({\n"
+      "        bridgeVersion = bridge.bridgeVersion,\n"
+      "        moduleBlend = { requestedOpacity = opacity, targetInstanceKey = instance_key },\n"
+      "        reason = 'unsupported-module-blend',\n"
+      "        session = session_object(),\n"
+      "        status = 'unavailable'\n"
+      "      })\n"
+      "    end\n"
+      "\n"
+      "    if string.sub(response_json, 1, 1) ~= '{' or string.sub(response_json, -1) ~= '}' then\n"
+      "      error('module blend payload malformed')\n"
+      "    end\n"
+      "\n"
+      "    return '{'\n"
+      "      .. '\"bridgeVersion\":' .. json_encode(bridge.bridgeVersion)\n"
+      "      .. ',\"session\":' .. json_encode(session_object())\n"
+      "      .. ',' .. string.sub(response_json, 2)\n"
+      "  end\n"
+      "\n"
+      "  local function on_view_changed(_, _, new_view)\n"
      "    bridge.view = new_view and tostring(new_view) or ''\n"
      "  end\n"
     "\n"
@@ -644,12 +731,13 @@ static gchar *build_lua_command(const gchar *command, const gchar *control_id,
     "  bridge.session_object = session_object\n"
     "  bridge.get_session = get_session\n"
     "  bridge.get_snapshot_json = get_snapshot_json\n"
-    "  bridge.list_controls = list_controls\n"
-     "  bridge.get_control = get_control\n"
-     "  bridge.set_control = set_control\n"
-     "  bridge.set_exposure = set_exposure\n"
-     "  bridge.apply_module_instance_action = apply_module_instance_action\n"
-     "  bridge.json_encode = json_encode\n"
+      "  bridge.list_controls = list_controls\n"
+      "  bridge.get_control = get_control\n"
+      "  bridge.set_control = set_control\n"
+      "  bridge.set_exposure = set_exposure\n"
+      "  bridge.apply_module_instance_action = apply_module_instance_action\n"
+      "  bridge.apply_module_instance_blend = apply_module_instance_blend\n"
+      "  bridge.json_encode = json_encode\n"
      "  bridge.update_view()\n"
      "  rawset(_G, '" DT_LIVE_BRIDGE_CACHE_KEY "', bridge)\n"
      "end\n"
@@ -673,9 +761,11 @@ static gchar *build_lua_command(const gchar *command, const gchar *control_id,
      "  response = bridge.set_control(control_id, numeric_value)\n"
       "elseif command == 'set-exposure' then\n"
       "  response = bridge.set_exposure(numeric_value)\n"
-      "elseif command == 'apply-module-instance-action' then\n"
-      "  return bridge.apply_module_instance_action(instance_key, module_action, anchor_instance_key)\n"
-      "else\n"
+       "elseif command == 'apply-module-instance-action' then\n"
+       "  return bridge.apply_module_instance_action(instance_key, module_action, anchor_instance_key)\n"
+       "elseif command == 'apply-module-instance-blend' then\n"
+       "  return bridge.apply_module_instance_blend(instance_key, numeric_value)\n"
+       "else\n"
      "  error('unknown command: ' .. tostring(command))\n"
     "end\n"
     "return bridge.json_encode(response)\n";
@@ -807,6 +897,19 @@ int main(int argc, char **argv)
       usage(stderr, progname);
       return 1;
     }
+  }
+  else if(argc == 4 && !strcmp(argv[1], "apply-module-instance-blend"))
+  {
+    g_autoptr(GError) parse_error = NULL;
+    if(!parse_blend_opacity_json(argv[3], &numeric_value, &parse_error))
+    {
+      fprintf(stderr, "%s\n", parse_error != NULL ? parse_error->message : "invalid blend json");
+      return 1;
+    }
+
+    command = "apply-module-instance-blend";
+    instance_key = argv[2];
+    have_numeric_value = TRUE;
   }
   else
   {
