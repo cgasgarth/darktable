@@ -326,6 +326,66 @@ else:
     print(payload.strip())
 PY
 )
+mask_target_json=$(python3 - "$snapshot_json" <<'PY'
+import json, sys
+snapshot = json.loads(sys.argv[1])
+module_stack = ((snapshot.get('snapshot') or {}).get('moduleStack') or [])
+for item in module_stack:
+    if not isinstance(item, dict):
+        continue
+    blend = item.get('blend') or {}
+    if blend.get('supported') is True and blend.get('masksSupported') is True and isinstance(item.get('instanceKey'), str) and item.get('instanceKey'):
+        print(json.dumps({
+            'instanceKey': item['instanceKey'],
+            'moduleOp': item.get('moduleOp'),
+        }, separators=(',', ':')))
+        break
+else:
+    raise SystemExit('no masks-supported target available')
+PY
+)
+mask_target_key=$(python3 - "$mask_target_json" <<'PY'
+import json, sys
+print(json.loads(sys.argv[1])['instanceKey'])
+PY
+)
+mask_reuse_target_json=$(python3 - "$snapshot_json" "$mask_target_key" <<'PY'
+import json, sys
+snapshot = json.loads(sys.argv[1])
+source_key = sys.argv[2]
+module_stack = ((snapshot.get('snapshot') or {}).get('moduleStack') or [])
+for item in module_stack:
+    if not isinstance(item, dict):
+        continue
+    blend = item.get('blend') or {}
+    if blend.get('supported') is True and blend.get('masksSupported') is True and item.get('instanceKey') != source_key:
+        print(json.dumps({
+            'status': 'found',
+            'instanceKey': item.get('instanceKey'),
+            'moduleOp': item.get('moduleOp'),
+        }, separators=(',', ':')))
+        break
+else:
+    print(json.dumps({'status': 'skipped', 'reason': 'no-secondary-mask-target'}, separators=(',', ':')))
+PY
+)
+mask_reuse_json=$(python3 - "$mask_reuse_target_json" "$bridge_bin" "$mask_target_key" <<'PY'
+import json, subprocess, sys
+target = json.loads(sys.argv[1])
+bridge = sys.argv[2]
+source = sys.argv[3]
+if target.get('status') != 'found':
+    print(json.dumps(target, separators=(',', ':')))
+else:
+    payload = subprocess.check_output(
+        [bridge, 'apply-module-instance-mask', target['instanceKey'], json.dumps({'action': 'reuse-same-shapes', 'sourceInstanceKey': source}, separators=(',', ':'))],
+        text=True,
+    )
+    print(payload.strip())
+PY
+)
+mask_clear_json=$(run_bridge apply-module-instance-mask "$mask_target_key" '{"action":"clear-mask"}')
+mask_unknown_source_json=$(run_bridge apply-module-instance-mask "$mask_target_key" '{"action":"reuse-same-shapes","sourceInstanceKey":"missing#0#0#"}')
 module_instance_target_json=$(python3 - "$snapshot_json" <<'PY'
 import json, sys
 snapshot = json.loads(sys.argv[1])
@@ -701,6 +761,7 @@ unsupported_view_snapshot_json=$(run_bridge get-snapshot)
 unsupported_view_get_control_json=$(run_bridge get-control exposure.exposure)
 unsupported_view_set_control_json=$(run_bridge set-control exposure.exposure "$requested_control_exposure")
 unsupported_view_module_instance_action_json=$(run_bridge apply-module-instance-action "$module_instance_key" "$module_instance_action")
+unsupported_view_module_mask_json=$(run_bridge apply-module-instance-mask "$mask_target_key" '{"action":"clear-mask"}')
 switch_to_darkroom
 wait_for_session_payload "$ready_attempts" >/dev/null
 
@@ -742,6 +803,18 @@ fi
 
 if run_bridge apply-module-instance-blend "$blend_target_key" '{"reverseOrder":"bad"}' >/dev/null 2>&1; then
   fail "apply-module-instance-blend accepted non-boolean reverseOrder"
+fi
+
+if run_bridge apply-module-instance-mask "$mask_target_key" '{}' >/dev/null 2>&1; then
+  fail "apply-module-instance-mask accepted missing action"
+fi
+
+if run_bridge apply-module-instance-mask "$mask_target_key" '{"action":"not-real"}' >/dev/null 2>&1; then
+  fail "apply-module-instance-mask accepted unknown action"
+fi
+
+if run_bridge apply-module-instance-mask "$mask_target_key" '{"action":"clear-mask","sourceInstanceKey":"exposure#0#0#"}' >/dev/null 2>&1; then
+  fail "apply-module-instance-mask accepted sourceInstanceKey for clear-mask"
 fi
 
 python3 - "$initial_json" "$snapshot_json" "$module_instance_target_json" "$list_json" "$get_control_json" "$set_json" "$post_set_exposure_json" "$set_control_json" "$post_set_control_json" "$unsupported_control_json" "$module_instance_action_json" "$module_instance_revert_json" "$module_instance_create_json" "$module_instance_duplicate_json" "$duplicate_result_target_json" "$duplicate_result_toggle_json" "$module_reorder_target_json" "$module_reorder_move_before_json" "$module_reorder_move_before_noop_json" "$module_reorder_move_after_json" "$unknown_anchor_module_reorder_json" "$module_delete_nonbase_target_json" "$module_delete_nonbase_json" "$post_delete_nonbase_snapshot_json" "$module_delete_target_json" "$module_delete_json" "$post_delete_snapshot_json" "$module_delete_blocked_target_json" "$module_delete_blocked_json" "$post_delete_blocked_snapshot_json" "$fence_blocked_module_reorder_json" "$rule_blocked_module_reorder_json" "$unsupported_module_action_json" "$unknown_module_instance_json" "$unsupported_view_snapshot_json" "$unsupported_view_get_control_json" "$unsupported_view_set_control_json" "$unsupported_view_module_instance_action_json" "$requested_exposure" "$requested_control_exposure" "$asset_path" <<'PY'
@@ -1415,4 +1488,110 @@ print('apply-module-instance-blend-revert:', json.dumps(blend_revert, separators
 print('apply-module-instance-blend-invalid-mode:', json.dumps(invalid_blend_mode, separators=(",", ":")))
 print('apply-module-instance-blend-unsupported:', json.dumps(unsupported_blend, separators=(",", ":")))
 print('result: blend snapshot and blend mutation controls validated')
+PY
+
+python3 - "$mask_target_json" "$mask_reuse_target_json" "$mask_reuse_json" "$mask_clear_json" "$mask_unknown_source_json" "$unsupported_view_module_mask_json" <<'PY'
+import json, sys
+
+mask_target = json.loads(sys.argv[1])
+mask_reuse_target = json.loads(sys.argv[2])
+mask_reuse = json.loads(sys.argv[3])
+mask_clear = json.loads(sys.argv[4])
+mask_unknown_source = json.loads(sys.argv[5])
+unsupported_view_mask = json.loads(sys.argv[6])
+
+target_key = mask_target.get('instanceKey')
+if not isinstance(target_key, str) or not target_key:
+    raise SystemExit(f'mask target missing instance key: {mask_target}')
+
+if mask_reuse_target.get('status') == 'found':
+    reuse_target_key = mask_reuse_target.get('instanceKey')
+    if mask_reuse.get('status') == 'ok':
+        reuse_module_mask = mask_reuse.get('moduleMask') or {}
+        if reuse_module_mask.get('targetInstanceKey') != reuse_target_key:
+            raise SystemExit(f'mask reuse target mismatch: {mask_reuse}')
+        if reuse_module_mask.get('action') != 'reuse-same-shapes':
+            raise SystemExit(f'mask reuse action mismatch: {mask_reuse}')
+        if reuse_module_mask.get('sourceInstanceKey') != target_key:
+            raise SystemExit(f'mask reuse source mismatch: {mask_reuse}')
+        if reuse_module_mask.get('currentHasMask') is not True:
+            raise SystemExit(f'mask reuse currentHasMask mismatch: {mask_reuse}')
+        if not (reuse_module_mask.get('sourceForms') or []):
+            raise SystemExit(f'mask reuse sourceForms should not be empty on success: {mask_reuse}')
+        if (reuse_module_mask.get('currentForms') or []) != (reuse_module_mask.get('sourceForms') or []):
+            raise SystemExit(f'mask reuse current/source forms mismatch: {mask_reuse}')
+        if reuse_module_mask.get('changed') is not True:
+            raise SystemExit(f'mask reuse should report changed=true on success: {mask_reuse}')
+        if reuse_module_mask.get('historyBefore') == reuse_module_mask.get('historyAfter'):
+            raise SystemExit(f'mask reuse should advance history on success: {mask_reuse}')
+    elif mask_reuse.get('status') == 'unavailable':
+        if mask_reuse.get('reason') not in ('source-module-mask-unavailable', 'target-module-mask-not-clear'):
+            raise SystemExit(f'mask reuse unavailable mismatch: {mask_reuse}')
+        reuse_module_mask = mask_reuse.get('moduleMask') or {}
+        if reuse_module_mask.get('currentHasMask') != reuse_module_mask.get('previousHasMask'):
+            raise SystemExit(f'mask reuse unavailable currentHasMask mismatch: {mask_reuse}')
+        if (reuse_module_mask.get('currentForms') or []) != (reuse_module_mask.get('previousForms') or []):
+            raise SystemExit(f'mask reuse unavailable currentForms mismatch: {mask_reuse}')
+    else:
+        raise SystemExit(f'mask reuse unexpected status: {mask_reuse}')
+else:
+    if mask_reuse.get('status') != 'skipped':
+        raise SystemExit(f'mask reuse skip mismatch: {mask_reuse}')
+
+if mask_clear.get('status') != 'ok':
+    raise SystemExit(f'mask clear failed: {mask_clear}')
+module_mask = mask_clear.get('moduleMask') or {}
+if module_mask.get('targetInstanceKey') != target_key:
+    raise SystemExit(f'mask clear target mismatch: {mask_clear}')
+if module_mask.get('action') != 'clear-mask':
+    raise SystemExit(f'mask clear action mismatch: {mask_clear}')
+if module_mask.get('currentHasMask') is not False:
+    raise SystemExit(f'mask clear currentHasMask mismatch: {mask_clear}')
+if (module_mask.get('currentForms') or []) != []:
+    raise SystemExit(f'mask clear currentForms should be empty: {mask_clear}')
+if not isinstance(module_mask.get('changed'), bool):
+    raise SystemExit(f'mask clear changed missing: {mask_clear}')
+if not isinstance(module_mask.get('historyBefore'), int) or not isinstance(module_mask.get('historyAfter'), int):
+    raise SystemExit(f'mask clear history markers missing: {mask_clear}')
+if module_mask.get('requestedHistoryEnd') != module_mask.get('historyAfter'):
+    raise SystemExit(f'mask clear requested history end mismatch: {mask_clear}')
+if module_mask.get('previousHasMask') is True:
+    if module_mask.get('changed') is not True:
+        raise SystemExit(f'mask clear should report changed=true when clearing shapes: {mask_clear}')
+    if module_mask.get('historyBefore') == module_mask.get('historyAfter'):
+        raise SystemExit(f'mask clear should advance history when clearing shapes: {mask_clear}')
+else:
+    if module_mask.get('changed') is not False:
+        raise SystemExit(f'mask clear should report changed=false when already clear: {mask_clear}')
+    if module_mask.get('historyBefore') != module_mask.get('historyAfter'):
+        raise SystemExit(f'mask clear should not advance history when already clear: {mask_clear}')
+
+mask_snapshot = (mask_clear.get('snapshot') or {})
+module_stack = mask_snapshot.get('moduleStack') or []
+matching = [item for item in module_stack if isinstance(item, dict) and item.get('instanceKey') == target_key]
+if len(matching) != 1:
+    raise SystemExit(f'mask clear snapshot target mismatch: {mask_clear}')
+
+if mask_unknown_source.get('status') != 'unavailable' or mask_unknown_source.get('reason') != 'unknown-source-instance-key':
+    raise SystemExit(f'mask unknown source mismatch: {mask_unknown_source}')
+unknown_mask = mask_unknown_source.get('moduleMask') or {}
+if unknown_mask.get('targetInstanceKey') != target_key:
+    raise SystemExit(f'mask unknown source target mismatch: {mask_unknown_source}')
+if unknown_mask.get('sourceInstanceKey') != 'missing#0#0#':
+    raise SystemExit(f'mask unknown source key mismatch: {mask_unknown_source}')
+if unknown_mask.get('currentHasMask') != unknown_mask.get('previousHasMask'):
+    raise SystemExit(f'mask unknown source currentHasMask mismatch: {mask_unknown_source}')
+if (unknown_mask.get('currentForms') or []) != (unknown_mask.get('previousForms') or []):
+    raise SystemExit(f'mask unknown source currentForms mismatch: {mask_unknown_source}')
+
+if unsupported_view_mask.get('status') != 'unavailable' or unsupported_view_mask.get('reason') != 'unsupported-view':
+    raise SystemExit(f'mask unsupported-view mismatch: {unsupported_view_mask}')
+if (unsupported_view_mask.get('session') or {}).get('view') != 'lighttable':
+    raise SystemExit(f'mask unsupported-view session mismatch: {unsupported_view_mask}')
+
+print('apply-module-instance-mask-reuse:', json.dumps(mask_reuse, separators=(",", ":")))
+print('apply-module-instance-mask-clear:', json.dumps(mask_clear, separators=(",", ":")))
+print('apply-module-instance-mask-unknown-source:', json.dumps(mask_unknown_source, separators=(",", ":")))
+print('apply-module-instance-mask-unsupported-view:', json.dumps(unsupported_view_mask, separators=(",", ":")))
+print('result: module mask controls validated')
 PY
