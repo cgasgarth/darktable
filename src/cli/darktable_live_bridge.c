@@ -43,8 +43,9 @@ static void usage(FILE *stream, const char *progname)
           "  %s get-control <control-id>\n"
           "  %s set-control <control-id> <value-json>\n"
           "  %s set-exposure <EV>\n"
+          "  %s apply-module-instance-action <instance-key> <action>\n"
           "  %s --help\n",
-          progname, progname, progname, progname, progname, progname, progname);
+          progname, progname, progname, progname, progname, progname, progname, progname);
 }
 
 static gboolean print_json_only(const gchar *json, GError **error)
@@ -171,6 +172,7 @@ static gboolean validate_exposure_value(const double value, const gchar *label, 
 }
 
 static gchar *build_lua_command(const gchar *command, const gchar *control_id,
+                                const gchar *instance_key, const gchar *module_action,
                                 gboolean have_numeric_value, double numeric_value)
 {
   const char *lua_template =
@@ -570,19 +572,43 @@ static gchar *build_lua_command(const gchar *command, const gchar *control_id,
     "    return response\n"
     "  end\n"
     "\n"
-    "  local function set_control(control_id, value)\n"
-    "    local adapter = lookup_control(control_id)\n"
-    "    if not adapter then return unavailable('unsupported-control', control_id) end\n"
-    "    local response = adapter.set(value)\n"
+     "  local function set_control(control_id, value)\n"
+     "    local adapter = lookup_control(control_id)\n"
+     "    if not adapter then return unavailable('unsupported-control', control_id) end\n"
+     "    local response = adapter.set(value)\n"
     "    if response and response.status == 'unavailable' and response.requestedControlId == nil then\n"
     "      response.requestedControlId = control_id\n"
-    "    end\n"
-    "    return response\n"
-    "  end\n"
-    "\n"
-    "  local function on_view_changed(_, _, new_view)\n"
-    "    bridge.view = new_view and tostring(new_view) or ''\n"
-    "  end\n"
+     "    end\n"
+     "    return response\n"
+     "  end\n"
+     "\n"
+     "  local function apply_module_instance_action(instance_key, action)\n"
+     "    local darkroom = darktable.gui.views.darkroom\n"
+     "    local response_json = darkroom and darkroom.live_apply_module_instance_action\n"
+     "      and darkroom.live_apply_module_instance_action(instance_key, action) or nil\n"
+     "    if type(response_json) ~= 'string' or response_json == '' then\n"
+     "      return json_encode({\n"
+     "        bridgeVersion = bridge.bridgeVersion,\n"
+     "        moduleAction = { action = action, targetInstanceKey = instance_key },\n"
+     "        reason = 'unsupported-module-state',\n"
+     "        session = session_object(),\n"
+     "        status = 'unavailable'\n"
+     "      })\n"
+     "    end\n"
+     "\n"
+     "    if string.sub(response_json, 1, 1) ~= '{' or string.sub(response_json, -1) ~= '}' then\n"
+     "      error('module action payload malformed')\n"
+     "    end\n"
+     "\n"
+     "    return '{'\n"
+     "      .. '\"bridgeVersion\":' .. json_encode(bridge.bridgeVersion)\n"
+     "      .. ',\"session\":' .. json_encode(session_object())\n"
+     "      .. ',' .. string.sub(response_json, 2)\n"
+     "  end\n"
+     "\n"
+     "  local function on_view_changed(_, _, new_view)\n"
+     "    bridge.view = new_view and tostring(new_view) or ''\n"
+     "  end\n"
     "\n"
     "  local function on_image_loaded()\n"
     "    bridge.imageLoadSequence = bridge.imageLoadSequence + 1\n"
@@ -617,20 +643,23 @@ static gchar *build_lua_command(const gchar *command, const gchar *control_id,
     "  bridge.get_session = get_session\n"
     "  bridge.get_snapshot_json = get_snapshot_json\n"
     "  bridge.list_controls = list_controls\n"
-    "  bridge.get_control = get_control\n"
-    "  bridge.set_control = set_control\n"
-    "  bridge.set_exposure = set_exposure\n"
-    "  bridge.json_encode = json_encode\n"
-    "  bridge.update_view()\n"
-    "  rawset(_G, '" DT_LIVE_BRIDGE_CACHE_KEY "', bridge)\n"
-    "end\n"
-    "\n"
-    "local command = %s\n"
-    "local control_id = %s\n"
-    "local numeric_value = %s\n"
-    "local response\n"
-    "if command == 'get-session' then\n"
-    "  response = bridge.get_session()\n"
+     "  bridge.get_control = get_control\n"
+     "  bridge.set_control = set_control\n"
+     "  bridge.set_exposure = set_exposure\n"
+     "  bridge.apply_module_instance_action = apply_module_instance_action\n"
+     "  bridge.json_encode = json_encode\n"
+     "  bridge.update_view()\n"
+     "  rawset(_G, '" DT_LIVE_BRIDGE_CACHE_KEY "', bridge)\n"
+     "end\n"
+     "\n"
+     "local command = %s\n"
+     "local control_id = %s\n"
+     "local instance_key = %s\n"
+     "local module_action = %s\n"
+     "local numeric_value = %s\n"
+     "local response\n"
+     "if command == 'get-session' then\n"
+     "  response = bridge.get_session()\n"
     "elseif command == 'get-snapshot' then\n"
     "  return bridge.get_snapshot_json()\n"
     "elseif command == 'list-controls' then\n"
@@ -638,16 +667,21 @@ static gchar *build_lua_command(const gchar *command, const gchar *control_id,
     "elseif command == 'get-control' then\n"
     "  response = bridge.get_control(control_id)\n"
     "elseif command == 'set-control' then\n"
-    "  response = bridge.set_control(control_id, numeric_value)\n"
-    "elseif command == 'set-exposure' then\n"
-    "  response = bridge.set_exposure(numeric_value)\n"
-    "else\n"
-    "  error('unknown command: ' .. tostring(command))\n"
+     "  response = bridge.set_control(control_id, numeric_value)\n"
+     "elseif command == 'set-exposure' then\n"
+     "  response = bridge.set_exposure(numeric_value)\n"
+     "elseif command == 'apply-module-instance-action' then\n"
+     "  return bridge.apply_module_instance_action(instance_key, module_action)\n"
+     "else\n"
+     "  error('unknown command: ' .. tostring(command))\n"
     "end\n"
     "return bridge.json_encode(response)\n";
 
   g_autofree gchar *command_literal = lua_string_literal(command);
   g_autofree gchar *control_literal = control_id != NULL ? lua_string_literal(control_id) : g_strdup("nil");
+  g_autofree gchar *instance_literal = instance_key != NULL ? lua_string_literal(instance_key) : g_strdup("nil");
+  g_autofree gchar *module_action_literal =
+    module_action != NULL ? lua_string_literal(module_action) : g_strdup("nil");
   const char *numeric_literal = "nil";
   gchar numeric_buffer[G_ASCII_DTOSTR_BUF_SIZE] = { 0 };
 
@@ -657,7 +691,8 @@ static gchar *build_lua_command(const gchar *command, const gchar *control_id,
     numeric_literal = numeric_buffer;
   }
 
-  return g_strdup_printf(lua_template, command_literal, control_literal, numeric_literal);
+  return g_strdup_printf(lua_template, command_literal, control_literal, instance_literal,
+                         module_action_literal, numeric_literal);
 }
 
 int main(int argc, char **argv)
@@ -672,6 +707,8 @@ int main(int argc, char **argv)
 
   const gchar *command = NULL;
   const gchar *control_id = NULL;
+  const gchar *instance_key = NULL;
+  const gchar *module_action = NULL;
   gboolean have_numeric_value = FALSE;
   double numeric_value = 0.0;
 
@@ -744,13 +781,20 @@ int main(int argc, char **argv)
     command = "set-exposure";
     have_numeric_value = TRUE;
   }
+  else if(argc == 4 && !strcmp(argv[1], "apply-module-instance-action"))
+  {
+    command = "apply-module-instance-action";
+    instance_key = argv[2];
+    module_action = argv[3];
+  }
   else
   {
     usage(stderr, progname);
     return 1;
   }
 
-  g_autofree gchar *lua_source = build_lua_command(command, control_id, have_numeric_value, numeric_value);
+  g_autofree gchar *lua_source =
+    build_lua_command(command, control_id, instance_key, module_action, have_numeric_value, numeric_value);
   if(lua_source == NULL)
   {
     fprintf(stderr, "failed to build Lua command\n");
