@@ -323,6 +323,120 @@ static gchar *_live_snapshot_instance_key(const char *module_op,
                          multi_name ? multi_name : "");
 }
 
+static const gchar *_live_snapshot_blend_mode_name(const uint32_t blend_mode)
+{
+  switch(blend_mode & DEVELOP_BLEND_MODE_MASK)
+  {
+    case DEVELOP_BLEND_NORMAL2:
+      return "normal";
+    case DEVELOP_BLEND_AVERAGE:
+      return "average";
+    case DEVELOP_BLEND_DIFFERENCE2:
+      return "difference";
+    case DEVELOP_BLEND_BOUNDED:
+      return "bounded";
+    case DEVELOP_BLEND_LIGHTEN:
+      return "lighten";
+    case DEVELOP_BLEND_DARKEN:
+      return "darken";
+    case DEVELOP_BLEND_SCREEN:
+      return "screen";
+    case DEVELOP_BLEND_MULTIPLY:
+      return "multiply";
+    case DEVELOP_BLEND_DIVIDE:
+      return "divide";
+    case DEVELOP_BLEND_ADD:
+      return "add";
+    case DEVELOP_BLEND_SUBTRACT:
+      return "subtract";
+    case DEVELOP_BLEND_GEOMETRIC_MEAN:
+      return "geometric-mean";
+    case DEVELOP_BLEND_HARMONIC_MEAN:
+      return "harmonic-mean";
+    case DEVELOP_BLEND_OVERLAY:
+      return "overlay";
+    case DEVELOP_BLEND_SOFTLIGHT:
+      return "softlight";
+    case DEVELOP_BLEND_HARDLIGHT:
+      return "hardlight";
+    case DEVELOP_BLEND_VIVIDLIGHT:
+      return "vividlight";
+    case DEVELOP_BLEND_LINEARLIGHT:
+      return "linearlight";
+    case DEVELOP_BLEND_PINLIGHT:
+      return "pinlight";
+    case DEVELOP_BLEND_LIGHTNESS:
+      return "lightness";
+    case DEVELOP_BLEND_CHROMATICITY:
+      return "chromaticity";
+    case DEVELOP_BLEND_LAB_LIGHTNESS:
+      return "lab-lightness";
+    case DEVELOP_BLEND_LAB_A:
+      return "lab-a";
+    case DEVELOP_BLEND_LAB_B:
+      return "lab-b";
+    case DEVELOP_BLEND_LAB_COLOR:
+      return "lab-color";
+    case DEVELOP_BLEND_RGB_R:
+      return "rgb-r";
+    case DEVELOP_BLEND_RGB_G:
+      return "rgb-g";
+    case DEVELOP_BLEND_RGB_B:
+      return "rgb-b";
+    case DEVELOP_BLEND_HSV_VALUE:
+      return "hsv-value";
+    case DEVELOP_BLEND_HSV_COLOR:
+      return "hsv-color";
+    case DEVELOP_BLEND_HUE:
+      return "hue";
+    case DEVELOP_BLEND_COLOR:
+      return "color";
+    case DEVELOP_BLEND_COLORADJUST:
+      return "coloradjust";
+    case DEVELOP_BLEND_DIFFERENCE:
+      return "difference-legacy";
+    case DEVELOP_BLEND_SUBTRACT_INVERSE:
+      return "subtract-inverse";
+    case DEVELOP_BLEND_DIVIDE_INVERSE:
+      return "divide-inverse";
+    case DEVELOP_BLEND_LAB_L:
+      return "lab-l";
+    default:
+      return "unknown";
+  }
+}
+
+static void _live_snapshot_add_blend(JsonBuilder *builder,
+                                     const char *module_op,
+                                     const dt_iop_module_t *module,
+                                     const dt_develop_blend_params_t *blend_params)
+{
+  const int flags = module != NULL ? module->flags() : dt_iop_get_module_flags(module_op);
+  const gboolean supported = blend_params != NULL && (flags & IOP_FLAGS_SUPPORTS_BLENDING);
+  const gboolean masks_supported = supported && !(flags & IOP_FLAGS_NO_MASKS);
+
+  json_builder_set_member_name(builder, "blend");
+  json_builder_begin_object(builder);
+  json_builder_set_member_name(builder, "supported");
+  json_builder_add_boolean_value(builder, supported);
+  json_builder_set_member_name(builder, "masksSupported");
+  json_builder_add_boolean_value(builder, masks_supported);
+
+  if(supported)
+  {
+    json_builder_set_member_name(builder, "opacity");
+    json_builder_add_double_value(builder, blend_params->opacity);
+    json_builder_set_member_name(builder, "blendMode");
+    json_builder_add_string_value(builder, _live_snapshot_blend_mode_name(blend_params->blend_mode));
+    json_builder_set_member_name(builder, "reverseOrder");
+    json_builder_add_boolean_value(builder,
+                                   (blend_params->blend_mode & DEVELOP_BLEND_REVERSE)
+                                     == DEVELOP_BLEND_REVERSE);
+  }
+
+  json_builder_end_object(builder);
+}
+
 static void _live_snapshot_add_stack_item(JsonBuilder *builder, dt_iop_module_t *module)
 {
   g_autofree gchar *instance_key =
@@ -342,6 +456,7 @@ static void _live_snapshot_add_stack_item(JsonBuilder *builder, dt_iop_module_t 
   json_builder_set_member_name(builder, "multiName");
   json_builder_add_string_value(builder, module->multi_name);
   _live_snapshot_add_params(builder, module, module->params);
+  _live_snapshot_add_blend(builder, module->op, module, module->blend_params);
   json_builder_end_object(builder);
 }
 
@@ -374,6 +489,7 @@ static void _live_snapshot_add_history_item(JsonBuilder *builder,
   json_builder_set_member_name(builder, "multiName");
   json_builder_add_string_value(builder, history_item->multi_name);
   _live_snapshot_add_params(builder, history_item->module, history_item->params);
+  _live_snapshot_add_blend(builder, module_op, module, history_item->blend_params);
   json_builder_end_object(builder);
 }
 
@@ -519,6 +635,21 @@ typedef struct dt_live_module_action_payload_t
   gint history_before;
   gint history_after;
 } dt_live_module_action_payload_t;
+
+typedef struct dt_live_module_blend_payload_t
+{
+  const gchar *instance_key;
+  dt_iop_module_t *module;
+  gboolean have_previous_opacity;
+  double previous_opacity;
+  gboolean have_requested_opacity;
+  double requested_opacity;
+  gboolean have_current_opacity;
+  double current_opacity;
+  gboolean have_history;
+  gint history_before;
+  gint history_after;
+} dt_live_module_blend_payload_t;
 
 typedef enum dt_live_module_reorder_check_t
 {
@@ -671,6 +802,175 @@ static void _live_snapshot_add_module_action(JsonBuilder *builder,
   }
 
   json_builder_end_object(builder);
+}
+
+static void _live_snapshot_add_module_blend(JsonBuilder *builder,
+                                            const dt_live_module_blend_payload_t *payload)
+{
+  json_builder_set_member_name(builder, "moduleBlend");
+  json_builder_begin_object(builder);
+  json_builder_set_member_name(builder, "targetInstanceKey");
+  json_builder_add_string_value(builder, payload != NULL && payload->instance_key ? payload->instance_key : "");
+
+  if(payload != NULL && payload->module != NULL)
+  {
+    json_builder_set_member_name(builder, "moduleOp");
+    json_builder_add_string_value(builder, payload->module->op);
+    json_builder_set_member_name(builder, "iopOrder");
+    json_builder_add_int_value(builder, payload->module->iop_order);
+    json_builder_set_member_name(builder, "multiPriority");
+    json_builder_add_int_value(builder, payload->module->multi_priority);
+    json_builder_set_member_name(builder, "multiName");
+    json_builder_add_string_value(builder, payload->module->multi_name);
+  }
+
+  if(payload != NULL && payload->have_previous_opacity)
+  {
+    json_builder_set_member_name(builder, "previousOpacity");
+    json_builder_add_double_value(builder, payload->previous_opacity);
+  }
+
+  if(payload != NULL && payload->have_requested_opacity)
+  {
+    json_builder_set_member_name(builder, "requestedOpacity");
+    json_builder_add_double_value(builder, payload->requested_opacity);
+  }
+
+  if(payload != NULL && payload->have_current_opacity)
+  {
+    json_builder_set_member_name(builder, "currentOpacity");
+    json_builder_add_double_value(builder, payload->current_opacity);
+  }
+
+  if(payload != NULL && payload->have_history)
+  {
+    json_builder_set_member_name(builder, "historyBefore");
+    json_builder_add_int_value(builder, payload->history_before);
+    json_builder_set_member_name(builder, "historyAfter");
+    json_builder_add_int_value(builder, payload->history_after);
+    json_builder_set_member_name(builder, "requestedHistoryEnd");
+    json_builder_add_int_value(builder, payload->history_after);
+  }
+
+  json_builder_end_object(builder);
+}
+
+static gchar *_live_apply_module_instance_blend_to_json(dt_develop_t *dev,
+                                                        const gchar *instance_key,
+                                                        const double requested_opacity)
+{
+  g_autoptr(JsonBuilder) builder = json_builder_new();
+  json_builder_begin_object(builder);
+
+  dt_live_module_blend_payload_t blend_payload = {
+    .instance_key = instance_key,
+    .have_requested_opacity = TRUE,
+    .requested_opacity = requested_opacity,
+  };
+
+  if(dt_view_get_current() != DT_VIEW_DARKROOM)
+  {
+    _live_snapshot_add_module_blend(builder, &blend_payload);
+    json_builder_set_member_name(builder, "reason");
+    json_builder_add_string_value(builder, "unsupported-view");
+    json_builder_set_member_name(builder, "status");
+    json_builder_add_string_value(builder, "unavailable");
+    json_builder_end_object(builder);
+    return _live_json_builder_to_string(builder);
+  }
+
+  if(dev == NULL || dev->image_storage.id == NO_IMGID)
+  {
+    _live_snapshot_add_module_blend(builder, &blend_payload);
+    json_builder_set_member_name(builder, "reason");
+    json_builder_add_string_value(builder, "no-active-image");
+    json_builder_set_member_name(builder, "status");
+    json_builder_add_string_value(builder, "unavailable");
+    json_builder_end_object(builder);
+    return _live_json_builder_to_string(builder);
+  }
+
+  _live_snapshot_add_active_image(builder, dev);
+
+  dt_iop_module_t *module = _live_snapshot_find_visible_module(dev, instance_key);
+  if(module == NULL)
+  {
+    _live_snapshot_add_module_blend(builder, &blend_payload);
+    json_builder_set_member_name(builder, "reason");
+    json_builder_add_string_value(builder, "unknown-instance-key");
+    json_builder_set_member_name(builder, "status");
+    json_builder_add_string_value(builder, "unavailable");
+    json_builder_end_object(builder);
+    return _live_json_builder_to_string(builder);
+  }
+
+  blend_payload.module = module;
+
+  if(!(module->flags() & IOP_FLAGS_SUPPORTS_BLENDING) || module->blend_params == NULL)
+  {
+    blend_payload.have_history = TRUE;
+    blend_payload.history_before = dev->history_end;
+    blend_payload.history_after = dev->history_end;
+    _live_snapshot_add_module_blend(builder, &blend_payload);
+    json_builder_set_member_name(builder, "reason");
+    json_builder_add_string_value(builder, "unsupported-module-blend");
+    json_builder_set_member_name(builder, "status");
+    json_builder_add_string_value(builder, "unavailable");
+    json_builder_end_object(builder);
+    return _live_json_builder_to_string(builder);
+  }
+
+  const double previous_opacity = module->blend_params->opacity;
+  const gint history_before = dev->history_end;
+
+  if(fabs(previous_opacity - requested_opacity) > 1e-6)
+  {
+    module->blend_params->opacity = requested_opacity;
+    dt_iop_commit_blend_params(module, module->blend_params);
+    dt_dev_add_history_item(dev, module, module->enabled);
+    dt_iop_gui_update_blending(module);
+  }
+
+  const double current_opacity = module->blend_params->opacity;
+  const gint history_after = dev->history_end;
+  g_autofree gchar *snapshot_json = _live_snapshot_to_json(dev);
+
+  blend_payload.have_previous_opacity = TRUE;
+  blend_payload.previous_opacity = previous_opacity;
+  blend_payload.have_current_opacity = TRUE;
+  blend_payload.current_opacity = current_opacity;
+  blend_payload.have_history = TRUE;
+  blend_payload.history_before = history_before;
+  blend_payload.history_after = history_after;
+  _live_snapshot_add_module_blend(builder, &blend_payload);
+
+  if(fabs(current_opacity - requested_opacity) > 1e-6)
+  {
+    json_builder_set_member_name(builder, "reason");
+    json_builder_add_string_value(builder, "module-blend-failed");
+    json_builder_set_member_name(builder, "status");
+    json_builder_add_string_value(builder, "unavailable");
+    json_builder_end_object(builder);
+    return _live_json_builder_to_string(builder);
+  }
+
+  JsonNode *snapshot_root = _live_json_copy_object_root(snapshot_json);
+  if(snapshot_root == NULL)
+  {
+    json_builder_set_member_name(builder, "reason");
+    json_builder_add_string_value(builder, "snapshot-unavailable");
+    json_builder_set_member_name(builder, "status");
+    json_builder_add_string_value(builder, "unavailable");
+    json_builder_end_object(builder);
+    return _live_json_builder_to_string(builder);
+  }
+
+  json_builder_set_member_name(builder, "snapshot");
+  json_builder_add_value(builder, snapshot_root);
+  json_builder_set_member_name(builder, "status");
+  json_builder_add_string_value(builder, "ok");
+  json_builder_end_object(builder);
+  return _live_json_builder_to_string(builder);
 }
 
 static dt_live_module_reorder_check_t _live_module_instance_check_reorder(dt_develop_t *dev,
@@ -1332,6 +1632,17 @@ static int live_apply_module_instance_action_cb(lua_State *L)
   return 1;
 }
 
+static int live_apply_module_instance_blend_cb(lua_State *L)
+{
+  dt_develop_t *dev = darktable.develop;
+  const gchar *instance_key = luaL_checkstring(L, 1);
+  const double requested_opacity = luaL_checknumber(L, 2);
+  g_autofree gchar *response_json =
+    _live_apply_module_instance_blend_to_json(dev, instance_key, requested_opacity);
+  lua_pushstring(L, response_json ? response_json : "{}");
+  return 1;
+}
+
 #endif
 
 // helpers to let us get the pointer's zoom position only when actually
@@ -1394,6 +1705,11 @@ void init(dt_view_t *self)
   dt_lua_gtk_wrap(L);
   lua_pushcclosure(L, dt_lua_type_member_common, 1);
   dt_lua_type_register_const_type(L, my_type, "live_apply_module_instance_action");
+  lua_pushlightuserdata(L, self);
+  lua_pushcclosure(L, live_apply_module_instance_blend_cb, 1);
+  dt_lua_gtk_wrap(L);
+  lua_pushcclosure(L, dt_lua_type_member_common, 1);
+  dt_lua_type_register_const_type(L, my_type, "live_apply_module_instance_blend");
 #endif
 }
 

@@ -19,6 +19,7 @@ shift
 source_asset_path=${DARKTABLE_LIVE_BRIDGE_ASSET:-/home/cgasgarth/Documents/projects/aiPhotoEditing/darktableAI/assets/_DSC8809.ARW}
 requested_exposure=${DARKTABLE_LIVE_BRIDGE_EXPOSURE:-1.25}
 requested_control_exposure=${DARKTABLE_LIVE_BRIDGE_CONTROL_EXPOSURE:-0.5}
+requested_blend_opacity=${DARKTABLE_LIVE_BRIDGE_BLEND_OPACITY:-73}
 darktable_bin=${DARKTABLE_LIVE_BRIDGE_DARKTABLE:-$repo_root/build/bin/darktable}
 bridge_bin=${DARKTABLE_LIVE_BRIDGE_HELPER:-$repo_root/build/bin/darktable-live-bridge}
 tmux_session=${DARKTABLE_LIVE_BRIDGE_TMUX_SESSION:-darktable-live-validate-$$}
@@ -188,6 +189,90 @@ wait_for_remote_lua
 
 initial_json=$(wait_for_session_payload "$ready_attempts")
 snapshot_json=$(run_bridge get-snapshot)
+blend_target_json=$(python3 - "$snapshot_json" "$requested_blend_opacity" <<'PY'
+import json, sys
+
+snapshot = json.loads(sys.argv[1])
+requested = float(sys.argv[2])
+module_stack = ((snapshot.get('snapshot') or {}).get('moduleStack') or [])
+
+for item in module_stack:
+    if not isinstance(item, dict):
+        continue
+    blend = item.get('blend') or {}
+    if blend.get('supported') is not True:
+        continue
+    instance_key = item.get('instanceKey')
+    opacity = blend.get('opacity')
+    if not isinstance(instance_key, str) or not instance_key:
+        continue
+    if not isinstance(opacity, (int, float)):
+        continue
+    target = requested
+    if abs(target - opacity) <= 1e-6:
+        target = 27.0 if abs(opacity - 27.0) > 1e-6 else 61.0
+    print(json.dumps({
+        'instanceKey': instance_key,
+        'moduleOp': item.get('moduleOp'),
+        'previousOpacity': opacity,
+        'requestedOpacity': target,
+    }, separators=(',', ':')))
+    break
+else:
+    raise SystemExit('no blend-capable visible module available')
+PY
+)
+blend_target_key=$(python3 - "$blend_target_json" <<'PY'
+import json, sys
+print(json.loads(sys.argv[1])['instanceKey'])
+PY
+)
+blend_requested_opacity=$(python3 - "$blend_target_json" <<'PY'
+import json, sys
+print(json.loads(sys.argv[1])['requestedOpacity'])
+PY
+)
+blend_previous_opacity=$(python3 - "$blend_target_json" <<'PY'
+import json, sys
+print(json.loads(sys.argv[1])['previousOpacity'])
+PY
+)
+blend_apply_json=$(run_bridge apply-module-instance-blend "$blend_target_key" "{\"opacity\":$blend_requested_opacity}")
+blend_followup_snapshot_json=$(run_bridge get-snapshot)
+blend_revert_json=$(run_bridge apply-module-instance-blend "$blend_target_key" "{\"opacity\":$blend_previous_opacity}")
+unsupported_blend_target_json=$(python3 - "$snapshot_json" <<'PY'
+import json, sys
+snapshot = json.loads(sys.argv[1])
+module_stack = ((snapshot.get('snapshot') or {}).get('moduleStack') or [])
+for item in module_stack:
+    if not isinstance(item, dict):
+        continue
+    blend = item.get('blend') or {}
+    if blend.get('supported') is False and isinstance(item.get('instanceKey'), str) and item.get('instanceKey'):
+        print(json.dumps({
+            'status': 'found',
+            'instanceKey': item['instanceKey'],
+            'moduleOp': item.get('moduleOp'),
+        }, separators=(',', ':')))
+        break
+else:
+    print(json.dumps({'status': 'skipped', 'reason': 'no-visible-unsupported-blend-module'}, separators=(',', ':')))
+PY
+)
+unsupported_blend_json=$(python3 - "$unsupported_blend_target_json" "$bridge_bin" <<'PY'
+import json, subprocess, sys
+target = json.loads(sys.argv[1])
+bridge = sys.argv[2]
+if target.get('status') != 'found':
+    print(json.dumps(target, separators=(',', ':')))
+else:
+    payload = subprocess.check_output(
+        [bridge, 'apply-module-instance-blend', target['instanceKey'], '{"opacity":55}'],
+        text=True,
+    )
+    print(payload.strip())
+PY
+)
 module_instance_target_json=$(python3 - "$snapshot_json" <<'PY'
 import json, sys
 snapshot = json.loads(sys.argv[1])
@@ -576,6 +661,22 @@ fi
 
 if run_bridge set-exposure 4.5 >/dev/null 2>&1; then
   fail "set-exposure accepted out-of-range exposure"
+fi
+
+if run_bridge apply-module-instance-blend "$blend_target_key" '{"opacity":"bad"}' >/dev/null 2>&1; then
+  fail "apply-module-instance-blend accepted non-numeric opacity"
+fi
+
+if run_bridge apply-module-instance-blend "$blend_target_key" '{}' >/dev/null 2>&1; then
+  fail "apply-module-instance-blend accepted missing opacity"
+fi
+
+if run_bridge apply-module-instance-blend "$blend_target_key" '{"opacity":50,"extra":true}' >/dev/null 2>&1; then
+  fail "apply-module-instance-blend accepted extra keys"
+fi
+
+if run_bridge apply-module-instance-blend "$blend_target_key" '{"opacity":101}' >/dev/null 2>&1; then
+  fail "apply-module-instance-blend accepted out-of-range opacity"
 fi
 
 python3 - "$initial_json" "$snapshot_json" "$module_instance_target_json" "$list_json" "$get_control_json" "$set_json" "$post_set_exposure_json" "$set_control_json" "$post_set_control_json" "$unsupported_control_json" "$module_instance_action_json" "$module_instance_revert_json" "$module_instance_create_json" "$module_instance_duplicate_json" "$duplicate_result_target_json" "$duplicate_result_toggle_json" "$module_reorder_target_json" "$module_reorder_move_before_json" "$module_reorder_move_before_noop_json" "$module_reorder_move_after_json" "$unknown_anchor_module_reorder_json" "$module_delete_nonbase_target_json" "$module_delete_nonbase_json" "$post_delete_nonbase_snapshot_json" "$module_delete_target_json" "$module_delete_json" "$post_delete_snapshot_json" "$module_delete_blocked_target_json" "$module_delete_blocked_json" "$post_delete_blocked_snapshot_json" "$fence_blocked_module_reorder_json" "$rule_blocked_module_reorder_json" "$unsupported_module_action_json" "$unknown_module_instance_json" "$unsupported_view_snapshot_json" "$unsupported_view_get_control_json" "$unsupported_view_set_control_json" "$unsupported_view_module_instance_action_json" "$requested_exposure" "$requested_control_exposure" "$asset_path" <<'PY'
@@ -1097,4 +1198,107 @@ print('unsupported-view-get-control:', json.dumps(unsupported_view_get, separato
 print('unsupported-view-set-control:', json.dumps(unsupported_view_set, separators=(",", ":")))
 print('unsupported-view-apply-module-instance-action:', json.dumps(unsupported_view_module_instance_action, separators=(",", ":")))
 print('result: exposure controls and module-instance actions validated')
+PY
+
+python3 - "$snapshot_json" "$blend_target_json" "$blend_apply_json" "$blend_followup_snapshot_json" "$blend_revert_json" "$unsupported_blend_target_json" "$unsupported_blend_json" "$asset_path" <<'PY'
+import json, math, os, sys
+
+snapshot = json.loads(sys.argv[1])
+blend_target = json.loads(sys.argv[2])
+blend_apply = json.loads(sys.argv[3])
+blend_followup = json.loads(sys.argv[4])
+blend_revert = json.loads(sys.argv[5])
+unsupported_target = json.loads(sys.argv[6])
+unsupported_blend = json.loads(sys.argv[7])
+asset = os.path.realpath(sys.argv[8])
+
+def expect_close(name, value, target):
+    if not isinstance(value, (int, float)) or math.isnan(value) or abs(value - target) > 1e-6:
+        raise SystemExit(f'{name} expected {target}, got {value}')
+
+def module_items(payload, instance_key):
+    module_stack = ((payload.get('snapshot') or {}).get('moduleStack') or [])
+    return [item for item in module_stack if isinstance(item, dict) and item.get('instanceKey') == instance_key]
+
+def expect_blend_shape(name, item):
+    blend = item.get('blend')
+    if not isinstance(blend, dict):
+        raise SystemExit(f'{name} missing blend object: {item}')
+    if not isinstance(blend.get('supported'), bool):
+        raise SystemExit(f'{name} blend supported missing: {item}')
+    if not isinstance(blend.get('masksSupported'), bool):
+        raise SystemExit(f'{name} blend masksSupported missing: {item}')
+    if blend.get('supported') is True:
+        if not isinstance(blend.get('blendMode'), str) or not blend.get('blendMode'):
+            raise SystemExit(f'{name} blendMode missing: {item}')
+        if not isinstance(blend.get('reverseOrder'), bool):
+            raise SystemExit(f'{name} reverseOrder missing: {item}')
+        if not isinstance(blend.get('opacity'), (int, float)):
+            raise SystemExit(f'{name} opacity missing: {item}')
+
+for index, item in enumerate(((snapshot.get('snapshot') or {}).get('moduleStack') or [])[:8]):
+    if isinstance(item, dict):
+        expect_blend_shape(f'moduleStack[{index}]', item)
+for index, item in enumerate(((snapshot.get('snapshot') or {}).get('historyItems') or [])[:8]):
+    if isinstance(item, dict):
+        expect_blend_shape(f'historyItems[{index}]', item)
+
+target_key = blend_target.get('instanceKey')
+requested_opacity = blend_target.get('requestedOpacity')
+previous_opacity = blend_target.get('previousOpacity')
+if not isinstance(target_key, str) or not target_key:
+    raise SystemExit(f'blend target missing instance key: {blend_target}')
+
+if blend_apply.get('status') != 'ok':
+    raise SystemExit(f'blend apply failed: {blend_apply}')
+active = blend_apply.get('activeImage') or {}
+if os.path.realpath(active.get('sourceAssetPath') or '') != asset:
+    raise SystemExit(f'blend apply active image mismatch: {blend_apply}')
+module_blend = blend_apply.get('moduleBlend') or {}
+if module_blend.get('targetInstanceKey') != target_key:
+    raise SystemExit(f'blend apply target mismatch: {blend_apply}')
+if not isinstance(module_blend.get('moduleOp'), str) or not module_blend.get('moduleOp'):
+    raise SystemExit(f'blend apply moduleOp missing: {blend_apply}')
+if not isinstance(module_blend.get('iopOrder'), int):
+    raise SystemExit(f'blend apply iopOrder missing: {blend_apply}')
+if not isinstance(module_blend.get('multiPriority'), int):
+    raise SystemExit(f'blend apply multiPriority missing: {blend_apply}')
+if not isinstance(module_blend.get('multiName'), str):
+    raise SystemExit(f'blend apply multiName missing: {blend_apply}')
+expect_close('blend apply previous opacity', module_blend.get('previousOpacity'), previous_opacity)
+expect_close('blend apply requested opacity', module_blend.get('requestedOpacity'), requested_opacity)
+expect_close('blend apply current opacity', module_blend.get('currentOpacity'), requested_opacity)
+if not isinstance(module_blend.get('historyBefore'), int) or not isinstance(module_blend.get('historyAfter'), int):
+    raise SystemExit(f'blend apply history markers missing: {blend_apply}')
+if module_blend.get('requestedHistoryEnd') != module_blend.get('historyAfter'):
+    raise SystemExit(f'blend apply requested history end mismatch: {blend_apply}')
+
+apply_items = module_items(blend_apply, target_key)
+if len(apply_items) != 1:
+    raise SystemExit(f'blend apply snapshot missing target item: {blend_apply}')
+expect_close('blend apply snapshot opacity', (apply_items[0].get('blend') or {}).get('opacity'), requested_opacity)
+
+followup_items = module_items(blend_followup, target_key)
+if len(followup_items) != 1:
+    raise SystemExit(f'blend follow-up snapshot missing target item: {blend_followup}')
+expect_close('blend follow-up snapshot opacity', (followup_items[0].get('blend') or {}).get('opacity'), requested_opacity)
+
+if blend_revert.get('status') != 'ok':
+    raise SystemExit(f'blend revert failed: {blend_revert}')
+expect_close('blend revert current opacity', (blend_revert.get('moduleBlend') or {}).get('currentOpacity'), previous_opacity)
+
+if unsupported_target.get('status') == 'found':
+    if unsupported_blend.get('status') != 'unavailable' or unsupported_blend.get('reason') != 'unsupported-module-blend':
+        raise SystemExit(f'unsupported blend response mismatch: {unsupported_blend}')
+    if (unsupported_blend.get('moduleBlend') or {}).get('targetInstanceKey') != unsupported_target.get('instanceKey'):
+        raise SystemExit(f'unsupported blend target mismatch: {unsupported_blend}')
+else:
+    if unsupported_blend.get('status') != 'skipped':
+        raise SystemExit(f'unsupported blend skip mismatch: {unsupported_blend}')
+
+print('apply-module-instance-blend:', json.dumps(blend_apply, separators=(",", ":")))
+print('apply-module-instance-blend-followup:', json.dumps(blend_followup, separators=(",", ":")))
+print('apply-module-instance-blend-revert:', json.dumps(blend_revert, separators=(",", ":")))
+print('apply-module-instance-blend-unsupported:', json.dumps(unsupported_blend, separators=(",", ":")))
+print('result: blend snapshot and opacity controls validated')
 PY
