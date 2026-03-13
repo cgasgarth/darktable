@@ -45,6 +45,12 @@ typedef struct dt_live_bridge_blend_request_t
   gboolean reverse_order;
 } dt_live_bridge_blend_request_t;
 
+typedef struct dt_live_bridge_mask_request_t
+{
+  const gchar *action;
+  const gchar *source_instance_key;
+} dt_live_bridge_mask_request_t;
+
 typedef struct dt_live_bridge_blend_mode_name_t
 {
   const gchar *name;
@@ -101,12 +107,13 @@ static void usage(FILE *stream, const char *progname)
           "  %s get-control <control-id>\n"
           "  %s set-control <control-id> <value-json>\n"
           "  %s set-exposure <EV>\n"
-          "  %s apply-module-instance-action <instance-key> <action>\n"
-          "  %s apply-module-instance-action <instance-key> <move-before|move-after> <anchor-instance-key>\n"
-          "  %s apply-module-instance-blend <instance-key> <blend-json>\n"
-          "  %s --help\n",
-          progname, progname, progname, progname, progname, progname, progname, progname, progname,
-          progname);
+           "  %s apply-module-instance-action <instance-key> <action>\n"
+           "  %s apply-module-instance-action <instance-key> <move-before|move-after> <anchor-instance-key>\n"
+           "  %s apply-module-instance-blend <instance-key> <blend-json>\n"
+           "  %s apply-module-instance-mask <instance-key> <mask-json>\n"
+           "  %s --help\n",
+           progname, progname, progname, progname, progname, progname, progname, progname, progname,
+           progname, progname);
 }
 
 static gboolean print_json_only(const gchar *json, GError **error)
@@ -363,6 +370,110 @@ static gboolean parse_blend_json(const gchar *json_text,
   return TRUE;
 }
 
+static gboolean parse_mask_json(const gchar *json_text,
+                                dt_live_bridge_mask_request_t *request_out,
+                                GError **error)
+{
+  g_autoptr(JsonParser) parser = json_parser_new();
+  if(!json_parser_load_from_data(parser, json_text, -1, error)) return FALSE;
+
+  JsonNode *root = json_parser_get_root(parser);
+  if(root == NULL || !JSON_NODE_HOLDS_OBJECT(root))
+  {
+    g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
+                        "mask value must be a JSON object");
+    return FALSE;
+  }
+
+  JsonObject *object = json_node_get_object(root);
+  if(object == NULL)
+  {
+    g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
+                        "mask value must be a JSON object");
+    return FALSE;
+  }
+
+  dt_live_bridge_mask_request_t request = { 0 };
+  GList *members = json_object_get_members(object);
+  for(const GList *iter = members; iter != NULL; iter = g_list_next(iter))
+  {
+    const gchar *key = iter->data;
+    JsonNode *member = json_object_get_member(object, key);
+
+    if(g_strcmp0(key, "action") == 0)
+    {
+      if(member == NULL || !JSON_NODE_HOLDS_VALUE(member)
+         || json_node_get_value_type(member) != G_TYPE_STRING)
+      {
+        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
+                            "mask action must be a JSON string");
+        g_list_free(members);
+        return FALSE;
+      }
+
+      const gchar *action = json_node_get_string(member);
+      if(g_strcmp0(action, "clear-mask") != 0 && g_strcmp0(action, "reuse-same-shapes") != 0)
+      {
+        g_set_error(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
+                    "unknown mask action: %s",
+                    action != NULL ? action : "");
+        g_list_free(members);
+        return FALSE;
+      }
+
+      request.action = action;
+    }
+    else if(g_strcmp0(key, "sourceInstanceKey") == 0)
+    {
+      if(member == NULL || !JSON_NODE_HOLDS_VALUE(member)
+         || json_node_get_value_type(member) != G_TYPE_STRING)
+      {
+        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
+                            "mask sourceInstanceKey must be a JSON string");
+        g_list_free(members);
+        return FALSE;
+      }
+
+      request.source_instance_key = json_node_get_string(member);
+    }
+    else
+    {
+      g_set_error(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
+                  "unknown mask field: %s",
+                  key != NULL ? key : "");
+      g_list_free(members);
+      return FALSE;
+    }
+  }
+  g_list_free(members);
+
+  if(request.action == NULL)
+  {
+    g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
+                        "mask value must include action");
+    return FALSE;
+  }
+
+  if(g_strcmp0(request.action, "reuse-same-shapes") == 0)
+  {
+    if(request.source_instance_key == NULL || request.source_instance_key[0] == '\0')
+    {
+      g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
+                          "mask reuse-same-shapes requires sourceInstanceKey");
+      return FALSE;
+    }
+  }
+  else if(request.source_instance_key != NULL)
+  {
+    g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
+                        "mask sourceInstanceKey is only supported for reuse-same-shapes");
+    return FALSE;
+  }
+
+  if(request_out != NULL) *request_out = request;
+  return TRUE;
+}
+
 static gboolean validate_exposure_value(const double value, const gchar *label, GError **error)
 {
   if(value < DT_LIVE_BRIDGE_EXPOSURE_MIN || value > DT_LIVE_BRIDGE_EXPOSURE_MAX)
@@ -376,10 +487,11 @@ static gboolean validate_exposure_value(const double value, const gchar *label, 
 }
 
 static gchar *build_lua_command(const gchar *command, const gchar *control_id,
-                                const gchar *instance_key, const gchar *module_action,
-                                const gchar *anchor_instance_key,
-                                gboolean have_numeric_value, double numeric_value,
-                                const gchar *blend_json)
+                                 const gchar *instance_key, const gchar *module_action,
+                                 const gchar *anchor_instance_key,
+                                 gboolean have_numeric_value, double numeric_value,
+                                 const gchar *blend_json,
+                                 const gchar *mask_json)
 {
   const char *lua_template =
     "local bridge = rawget(_G, '" DT_LIVE_BRIDGE_CACHE_KEY "')\n"
@@ -812,7 +924,7 @@ static gchar *build_lua_command(const gchar *command, const gchar *control_id,
       "      .. ',' .. string.sub(response_json, 2)\n"
       "  end\n"
       "\n"
-      "  local function apply_module_instance_blend(instance_key, blend_json)\n"
+       "  local function apply_module_instance_blend(instance_key, blend_json)\n"
       "    local darkroom = darktable.gui.views.darkroom\n"
       "    local response_json = darkroom and darkroom.live_apply_module_instance_blend\n"
       "      and darkroom.live_apply_module_instance_blend(instance_key, blend_json) or nil\n"
@@ -830,13 +942,37 @@ static gchar *build_lua_command(const gchar *command, const gchar *control_id,
       "      error('module blend payload malformed')\n"
       "    end\n"
       "\n"
-      "    return '{'\n"
-      "      .. '\"bridgeVersion\":' .. json_encode(bridge.bridgeVersion)\n"
-      "      .. ',\"session\":' .. json_encode(session_object())\n"
-      "      .. ',' .. string.sub(response_json, 2)\n"
-      "  end\n"
-      "\n"
-      "  local function on_view_changed(_, _, new_view)\n"
+       "    return '{'\n"
+       "      .. '\"bridgeVersion\":' .. json_encode(bridge.bridgeVersion)\n"
+       "      .. ',\"session\":' .. json_encode(session_object())\n"
+       "      .. ',' .. string.sub(response_json, 2)\n"
+       "  end\n"
+       "\n"
+       "  local function apply_module_instance_mask(instance_key, mask_json)\n"
+       "    local darkroom = darktable.gui.views.darkroom\n"
+       "    local response_json = darkroom and darkroom.live_apply_module_instance_mask\n"
+       "      and darkroom.live_apply_module_instance_mask(instance_key, mask_json) or nil\n"
+       "    if type(response_json) ~= 'string' or response_json == '' then\n"
+       "      return json_encode({\n"
+       "        bridgeVersion = bridge.bridgeVersion,\n"
+       "        moduleMask = { targetInstanceKey = instance_key },\n"
+       "        reason = 'unsupported-module-mask',\n"
+       "        session = session_object(),\n"
+       "        status = 'unavailable'\n"
+       "      })\n"
+       "    end\n"
+       "\n"
+       "    if string.sub(response_json, 1, 1) ~= '{' or string.sub(response_json, -1) ~= '}' then\n"
+       "      error('module mask payload malformed')\n"
+       "    end\n"
+       "\n"
+       "    return '{'\n"
+       "      .. '\"bridgeVersion\":' .. json_encode(bridge.bridgeVersion)\n"
+       "      .. ',\"session\":' .. json_encode(session_object())\n"
+       "      .. ',' .. string.sub(response_json, 2)\n"
+       "  end\n"
+       "\n"
+       "  local function on_view_changed(_, _, new_view)\n"
      "    bridge.view = new_view and tostring(new_view) or ''\n"
      "  end\n"
     "\n"
@@ -874,11 +1010,12 @@ static gchar *build_lua_command(const gchar *command, const gchar *control_id,
     "  bridge.get_snapshot_json = get_snapshot_json\n"
       "  bridge.list_controls = list_controls\n"
       "  bridge.get_control = get_control\n"
-      "  bridge.set_control = set_control\n"
-      "  bridge.set_exposure = set_exposure\n"
-      "  bridge.apply_module_instance_action = apply_module_instance_action\n"
-      "  bridge.apply_module_instance_blend = apply_module_instance_blend\n"
-      "  bridge.json_encode = json_encode\n"
+       "  bridge.set_control = set_control\n"
+       "  bridge.set_exposure = set_exposure\n"
+       "  bridge.apply_module_instance_action = apply_module_instance_action\n"
+       "  bridge.apply_module_instance_blend = apply_module_instance_blend\n"
+       "  bridge.apply_module_instance_mask = apply_module_instance_mask\n"
+       "  bridge.json_encode = json_encode\n"
      "  bridge.update_view()\n"
      "  rawset(_G, '" DT_LIVE_BRIDGE_CACHE_KEY "', bridge)\n"
      "end\n"
@@ -887,10 +1024,11 @@ static gchar *build_lua_command(const gchar *command, const gchar *control_id,
       "local control_id = %s\n"
       "local instance_key = %s\n"
       "local module_action = %s\n"
-      "local anchor_instance_key = %s\n"
-      "local numeric_value = %s\n"
-     "local blend_json = %s\n"
-     "local response\n"
+       "local anchor_instance_key = %s\n"
+       "local numeric_value = %s\n"
+      "local blend_json = %s\n"
+      "local mask_json = %s\n"
+      "local response\n"
      "if command == 'get-session' then\n"
      "  response = bridge.get_session()\n"
     "elseif command == 'get-snapshot' then\n"
@@ -907,6 +1045,8 @@ static gchar *build_lua_command(const gchar *command, const gchar *control_id,
        "  return bridge.apply_module_instance_action(instance_key, module_action, anchor_instance_key)\n"
        "elseif command == 'apply-module-instance-blend' then\n"
        "  return bridge.apply_module_instance_blend(instance_key, blend_json)\n"
+       "elseif command == 'apply-module-instance-mask' then\n"
+       "  return bridge.apply_module_instance_mask(instance_key, mask_json)\n"
        "else\n"
      "  error('unknown command: ' .. tostring(command))\n"
     "end\n"
@@ -920,6 +1060,7 @@ static gchar *build_lua_command(const gchar *command, const gchar *control_id,
   g_autofree gchar *anchor_instance_literal =
     anchor_instance_key != NULL ? lua_string_literal(anchor_instance_key) : g_strdup("nil");
   g_autofree gchar *blend_json_literal = blend_json != NULL ? lua_string_literal(blend_json) : g_strdup("nil");
+  g_autofree gchar *mask_json_literal = mask_json != NULL ? lua_string_literal(mask_json) : g_strdup("nil");
   const char *numeric_literal = "nil";
   gchar numeric_buffer[G_ASCII_DTOSTR_BUF_SIZE] = { 0 };
 
@@ -930,8 +1071,8 @@ static gchar *build_lua_command(const gchar *command, const gchar *control_id,
   }
 
   return g_strdup_printf(lua_template, command_literal, control_literal, instance_literal,
-                         module_action_literal, anchor_instance_literal, numeric_literal,
-                         blend_json_literal);
+                          module_action_literal, anchor_instance_literal, numeric_literal,
+                          blend_json_literal, mask_json_literal);
 }
 
 int main(int argc, char **argv)
@@ -950,6 +1091,7 @@ int main(int argc, char **argv)
   const gchar *module_action = NULL;
   const gchar *anchor_instance_key = NULL;
   const gchar *blend_json = NULL;
+  const gchar *mask_json = NULL;
   gboolean have_numeric_value = FALSE;
   double numeric_value = 0.0;
 
@@ -1057,6 +1199,20 @@ int main(int argc, char **argv)
     instance_key = argv[2];
     blend_json = argv[3];
   }
+  else if(argc == 4 && !strcmp(argv[1], "apply-module-instance-mask"))
+  {
+    dt_live_bridge_mask_request_t mask_request = { 0 };
+    g_autoptr(GError) parse_error = NULL;
+    if(!parse_mask_json(argv[3], &mask_request, &parse_error))
+    {
+      fprintf(stderr, "%s\n", parse_error != NULL ? parse_error->message : "invalid mask json");
+      return 1;
+    }
+
+    command = "apply-module-instance-mask";
+    instance_key = argv[2];
+    mask_json = argv[3];
+  }
   else
   {
     usage(stderr, progname);
@@ -1065,7 +1221,7 @@ int main(int argc, char **argv)
 
   g_autofree gchar *lua_source =
     build_lua_command(command, control_id, instance_key, module_action, anchor_instance_key,
-                      have_numeric_value, numeric_value, blend_json);
+                      have_numeric_value, numeric_value, blend_json, mask_json);
   if(lua_source == NULL)
   {
     fprintf(stderr, "failed to build Lua command\n");

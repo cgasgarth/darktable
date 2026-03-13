@@ -424,6 +424,107 @@ static const gchar *_live_snapshot_blend_colorspace_name(const dt_develop_blend_
   }
 }
 
+typedef enum dt_live_module_mask_action_t
+{
+  DT_LIVE_MODULE_MASK_ACTION_INVALID = 0,
+  DT_LIVE_MODULE_MASK_ACTION_CLEAR_MASK,
+  DT_LIVE_MODULE_MASK_ACTION_REUSE_SAME_SHAPES,
+} dt_live_module_mask_action_t;
+
+typedef struct dt_live_module_mask_form_t
+{
+  dt_mask_id_t formid;
+  gint state;
+  float opacity;
+} dt_live_module_mask_form_t;
+
+static dt_live_module_mask_action_t _live_module_mask_action_from_string(const gchar *action)
+{
+  if(g_strcmp0(action, "clear-mask") == 0) return DT_LIVE_MODULE_MASK_ACTION_CLEAR_MASK;
+  if(g_strcmp0(action, "reuse-same-shapes") == 0) return DT_LIVE_MODULE_MASK_ACTION_REUSE_SAME_SHAPES;
+  return DT_LIVE_MODULE_MASK_ACTION_INVALID;
+}
+
+static dt_masks_form_t *_live_mask_group_from_module(dt_develop_t *dev, dt_iop_module_t *module)
+{
+  if(dev == NULL || module == NULL || module->blend_params == NULL) return NULL;
+  if(!dt_is_valid_maskid(module->blend_params->mask_id)) return NULL;
+
+  dt_masks_form_t *group = dt_masks_get_from_id(dev, module->blend_params->mask_id);
+  if(group == NULL || !(group->type & DT_MASKS_GROUP)) return NULL;
+  return group;
+}
+
+static GArray *_live_mask_collect_forms(dt_masks_form_t *group)
+{
+  GArray *forms = g_array_new(FALSE, FALSE, sizeof(dt_live_module_mask_form_t));
+  if(group == NULL || !(group->type & DT_MASKS_GROUP)) return forms;
+
+  for(const GList *iter = group->points; iter != NULL; iter = g_list_next(iter))
+  {
+    const dt_masks_point_group_t *point = iter->data;
+    if(point == NULL) continue;
+
+    const dt_live_module_mask_form_t form = {
+      .formid = point->formid,
+      .state = point->state,
+      .opacity = point->opacity,
+    };
+    g_array_append_val(forms, form);
+  }
+
+  return forms;
+}
+
+static gboolean _live_mask_forms_equal(const GArray *left, const GArray *right)
+{
+  const guint left_len = left != NULL ? left->len : 0;
+  const guint right_len = right != NULL ? right->len : 0;
+  if(left_len != right_len) return FALSE;
+
+  for(guint index = 0; index < left_len; index++)
+  {
+    const dt_live_module_mask_form_t *left_form = &g_array_index(left, dt_live_module_mask_form_t, index);
+    const dt_live_module_mask_form_t *right_form = &g_array_index(right, dt_live_module_mask_form_t, index);
+    if(left_form->formid != right_form->formid) return FALSE;
+    if(left_form->state != right_form->state) return FALSE;
+    if(fabsf(left_form->opacity - right_form->opacity) > 1e-6f) return FALSE;
+  }
+
+  return TRUE;
+}
+
+static gboolean _live_mask_forms_have_entries(const GArray *forms)
+{
+  return forms != NULL && forms->len > 0;
+}
+
+static void _live_snapshot_add_mask_forms(JsonBuilder *builder,
+                                          const gchar *member_name,
+                                          const GArray *forms)
+{
+  json_builder_set_member_name(builder, member_name);
+  json_builder_begin_array(builder);
+
+  if(forms != NULL)
+  {
+    for(guint index = 0; index < forms->len; index++)
+    {
+      const dt_live_module_mask_form_t *form = &g_array_index(forms, dt_live_module_mask_form_t, index);
+      json_builder_begin_object(builder);
+      json_builder_set_member_name(builder, "formId");
+      json_builder_add_int_value(builder, form->formid);
+      json_builder_set_member_name(builder, "state");
+      json_builder_add_int_value(builder, form->state);
+      json_builder_set_member_name(builder, "opacity");
+      json_builder_add_double_value(builder, form->opacity);
+      json_builder_end_object(builder);
+    }
+  }
+
+  json_builder_end_array(builder);
+}
+
 static gboolean _live_snapshot_parse_blend_mode_name(const gchar *blend_mode_name,
                                                      uint32_t *blend_mode_out)
 {
@@ -875,6 +976,32 @@ typedef struct dt_live_module_blend_request_t
   gboolean reverse_order;
 } dt_live_module_blend_request_t;
 
+typedef struct dt_live_module_mask_payload_t
+{
+  const gchar *instance_key;
+  const gchar *action;
+  const gchar *source_instance_key;
+  dt_iop_module_t *module;
+  gboolean have_previous_has_mask;
+  gboolean previous_has_mask;
+  gboolean have_current_has_mask;
+  gboolean current_has_mask;
+  gboolean have_changed;
+  gboolean changed;
+  GArray *previous_forms;
+  GArray *source_forms;
+  GArray *current_forms;
+  gboolean have_history;
+  gint history_before;
+  gint history_after;
+} dt_live_module_mask_payload_t;
+
+typedef struct dt_live_module_mask_request_t
+{
+  dt_live_module_mask_action_t action;
+  gchar *source_instance_key;
+} dt_live_module_mask_request_t;
+
 typedef enum dt_live_module_reorder_check_t
 {
   DT_LIVE_MODULE_REORDER_CHECK_OK = 0,
@@ -1115,6 +1242,69 @@ static void _live_snapshot_add_module_blend(JsonBuilder *builder,
   json_builder_end_object(builder);
 }
 
+static void _live_snapshot_add_module_mask(JsonBuilder *builder,
+                                           const dt_live_module_mask_payload_t *payload)
+{
+  json_builder_set_member_name(builder, "moduleMask");
+  json_builder_begin_object(builder);
+  json_builder_set_member_name(builder, "targetInstanceKey");
+  json_builder_add_string_value(builder, payload != NULL && payload->instance_key ? payload->instance_key : "");
+  json_builder_set_member_name(builder, "action");
+  json_builder_add_string_value(builder, payload != NULL && payload->action ? payload->action : "");
+
+  if(payload != NULL && payload->source_instance_key != NULL)
+  {
+    json_builder_set_member_name(builder, "sourceInstanceKey");
+    json_builder_add_string_value(builder, payload->source_instance_key);
+  }
+
+  if(payload != NULL && payload->module != NULL)
+  {
+    json_builder_set_member_name(builder, "moduleOp");
+    json_builder_add_string_value(builder, payload->module->op);
+    json_builder_set_member_name(builder, "iopOrder");
+    json_builder_add_int_value(builder, payload->module->iop_order);
+    json_builder_set_member_name(builder, "multiPriority");
+    json_builder_add_int_value(builder, payload->module->multi_priority);
+    json_builder_set_member_name(builder, "multiName");
+    json_builder_add_string_value(builder, payload->module->multi_name);
+  }
+
+  if(payload != NULL && payload->have_previous_has_mask)
+  {
+    json_builder_set_member_name(builder, "previousHasMask");
+    json_builder_add_boolean_value(builder, payload->previous_has_mask);
+  }
+
+  if(payload != NULL && payload->have_current_has_mask)
+  {
+    json_builder_set_member_name(builder, "currentHasMask");
+    json_builder_add_boolean_value(builder, payload->current_has_mask);
+  }
+
+  if(payload != NULL && payload->have_changed)
+  {
+    json_builder_set_member_name(builder, "changed");
+    json_builder_add_boolean_value(builder, payload->changed);
+  }
+
+  _live_snapshot_add_mask_forms(builder, "previousForms", payload != NULL ? payload->previous_forms : NULL);
+  _live_snapshot_add_mask_forms(builder, "sourceForms", payload != NULL ? payload->source_forms : NULL);
+  _live_snapshot_add_mask_forms(builder, "currentForms", payload != NULL ? payload->current_forms : NULL);
+
+  if(payload != NULL && payload->have_history)
+  {
+    json_builder_set_member_name(builder, "historyBefore");
+    json_builder_add_int_value(builder, payload->history_before);
+    json_builder_set_member_name(builder, "historyAfter");
+    json_builder_add_int_value(builder, payload->history_after);
+    json_builder_set_member_name(builder, "requestedHistoryEnd");
+    json_builder_add_int_value(builder, payload->history_after);
+  }
+
+  json_builder_end_object(builder);
+}
+
 static gboolean _live_parse_module_instance_blend_request(const gchar *json_text,
                                                           dt_live_module_blend_request_t *request_out)
 {
@@ -1190,6 +1380,86 @@ static gboolean _live_parse_module_instance_blend_request(const gchar *json_text
   g_list_free(members);
 
   if(!request.have_opacity && !request.have_blend_mode && !request.have_reverse_order) return FALSE;
+
+  *request_out = request;
+  return TRUE;
+}
+
+static gboolean _live_parse_module_instance_mask_request(const gchar *json_text,
+                                                         dt_live_module_mask_request_t *request_out)
+{
+  if(json_text == NULL || json_text[0] == '\0' || request_out == NULL) return FALSE;
+
+  g_autoptr(JsonParser) parser = json_parser_new();
+  if(!json_parser_load_from_data(parser, json_text, -1, NULL)) return FALSE;
+
+  JsonNode *root = json_parser_get_root(parser);
+  if(root == NULL || !JSON_NODE_HOLDS_OBJECT(root)) return FALSE;
+
+  JsonObject *object = json_node_get_object(root);
+  if(object == NULL) return FALSE;
+
+  dt_live_module_mask_request_t request = { 0 };
+  GList *members = json_object_get_members(object);
+  for(const GList *iter = members; iter != NULL; iter = g_list_next(iter))
+  {
+    const gchar *key = iter->data;
+    JsonNode *member = json_object_get_member(object, key);
+
+    if(g_strcmp0(key, "action") == 0)
+    {
+      if(member == NULL || !JSON_NODE_HOLDS_VALUE(member)
+         || json_node_get_value_type(member) != G_TYPE_STRING)
+      {
+        g_list_free(members);
+        return FALSE;
+      }
+
+      request.action = _live_module_mask_action_from_string(json_node_get_string(member));
+      if(request.action == DT_LIVE_MODULE_MASK_ACTION_INVALID)
+      {
+        g_free(request.source_instance_key);
+        g_list_free(members);
+        return FALSE;
+      }
+    }
+    else if(g_strcmp0(key, "sourceInstanceKey") == 0)
+    {
+      if(member == NULL || !JSON_NODE_HOLDS_VALUE(member)
+         || json_node_get_value_type(member) != G_TYPE_STRING)
+      {
+        g_list_free(members);
+        return FALSE;
+      }
+
+      request.source_instance_key = g_strdup(json_node_get_string(member));
+    }
+    else
+    {
+      g_free(request.source_instance_key);
+      g_list_free(members);
+      return FALSE;
+    }
+  }
+  g_list_free(members);
+
+  if(request.action == DT_LIVE_MODULE_MASK_ACTION_INVALID)
+  {
+    g_free(request.source_instance_key);
+    return FALSE;
+  }
+  if(request.action == DT_LIVE_MODULE_MASK_ACTION_REUSE_SAME_SHAPES
+     && (request.source_instance_key == NULL || request.source_instance_key[0] == '\0'))
+  {
+    g_free(request.source_instance_key);
+    return FALSE;
+  }
+  if(request.action != DT_LIVE_MODULE_MASK_ACTION_REUSE_SAME_SHAPES
+     && request.source_instance_key != NULL)
+  {
+    g_free(request.source_instance_key);
+    return FALSE;
+  }
 
   *request_out = request;
   return TRUE;
@@ -1421,6 +1691,298 @@ static gchar *_live_apply_module_instance_blend_to_json(dt_develop_t *dev,
   json_builder_add_string_value(builder, "ok");
   json_builder_end_object(builder);
   return _live_json_builder_to_string(builder);
+}
+
+static gboolean _live_module_masks_supported(dt_iop_module_t *module)
+{
+  return module != NULL && module->blend_params != NULL
+         && (module->flags() & IOP_FLAGS_SUPPORTS_BLENDING)
+         && !(module->flags() & IOP_FLAGS_NO_MASKS);
+}
+
+static gchar *_live_apply_module_instance_mask_to_json(dt_develop_t *dev,
+                                                       const gchar *instance_key,
+                                                       const dt_live_module_mask_request_t *request)
+{
+  g_autoptr(JsonBuilder) builder = json_builder_new();
+  json_builder_begin_object(builder);
+
+  dt_live_module_mask_payload_t mask_payload = {
+    .instance_key = instance_key,
+    .action = request != NULL && request->action == DT_LIVE_MODULE_MASK_ACTION_REUSE_SAME_SHAPES
+                ? "reuse-same-shapes"
+                : "clear-mask",
+    .source_instance_key = request != NULL ? request->source_instance_key : NULL,
+    .previous_forms = g_array_new(FALSE, FALSE, sizeof(dt_live_module_mask_form_t)),
+    .source_forms = g_array_new(FALSE, FALSE, sizeof(dt_live_module_mask_form_t)),
+    .current_forms = g_array_new(FALSE, FALSE, sizeof(dt_live_module_mask_form_t)),
+  };
+
+  if(dt_view_get_current() != DT_VIEW_DARKROOM)
+  {
+    _live_snapshot_add_module_mask(builder, &mask_payload);
+    json_builder_set_member_name(builder, "reason");
+    json_builder_add_string_value(builder, "unsupported-view");
+    json_builder_set_member_name(builder, "status");
+    json_builder_add_string_value(builder, "unavailable");
+    json_builder_end_object(builder);
+    gchar *result = _live_json_builder_to_string(builder);
+    g_array_unref(mask_payload.previous_forms);
+    g_array_unref(mask_payload.source_forms);
+    g_array_unref(mask_payload.current_forms);
+    return result;
+  }
+
+  if(dev == NULL || dev->image_storage.id == NO_IMGID)
+  {
+    _live_snapshot_add_module_mask(builder, &mask_payload);
+    json_builder_set_member_name(builder, "reason");
+    json_builder_add_string_value(builder, "no-active-image");
+    json_builder_set_member_name(builder, "status");
+    json_builder_add_string_value(builder, "unavailable");
+    json_builder_end_object(builder);
+    gchar *result = _live_json_builder_to_string(builder);
+    g_array_unref(mask_payload.previous_forms);
+    g_array_unref(mask_payload.source_forms);
+    g_array_unref(mask_payload.current_forms);
+    return result;
+  }
+
+  _live_snapshot_add_active_image(builder, dev);
+
+  dt_iop_module_t *module = _live_snapshot_find_visible_module(dev, instance_key);
+  if(module == NULL)
+  {
+    _live_snapshot_add_module_mask(builder, &mask_payload);
+    json_builder_set_member_name(builder, "reason");
+    json_builder_add_string_value(builder, "unknown-instance-key");
+    json_builder_set_member_name(builder, "status");
+    json_builder_add_string_value(builder, "unavailable");
+    json_builder_end_object(builder);
+    gchar *result = _live_json_builder_to_string(builder);
+    g_array_unref(mask_payload.previous_forms);
+    g_array_unref(mask_payload.source_forms);
+    g_array_unref(mask_payload.current_forms);
+    return result;
+  }
+
+  mask_payload.module = module;
+  const gint history_before = dev->history_end;
+
+  if(!_live_module_masks_supported(module))
+  {
+    mask_payload.have_previous_has_mask = TRUE;
+    mask_payload.previous_has_mask = FALSE;
+    mask_payload.have_current_has_mask = TRUE;
+    mask_payload.current_has_mask = FALSE;
+    mask_payload.have_changed = TRUE;
+    mask_payload.changed = FALSE;
+    mask_payload.have_history = TRUE;
+    mask_payload.history_before = history_before;
+    mask_payload.history_after = history_before;
+    _live_snapshot_add_module_mask(builder, &mask_payload);
+    json_builder_set_member_name(builder, "reason");
+    json_builder_add_string_value(builder, "unsupported-module-mask");
+    json_builder_set_member_name(builder, "status");
+    json_builder_add_string_value(builder, "unavailable");
+    json_builder_end_object(builder);
+    gchar *result = _live_json_builder_to_string(builder);
+    g_array_unref(mask_payload.previous_forms);
+    g_array_unref(mask_payload.source_forms);
+    g_array_unref(mask_payload.current_forms);
+    return result;
+  }
+
+  dt_masks_form_t *previous_group = _live_mask_group_from_module(dev, module);
+  GArray *previous_forms = _live_mask_collect_forms(previous_group);
+  g_array_unref(mask_payload.previous_forms);
+  mask_payload.previous_forms = previous_forms;
+  mask_payload.have_previous_has_mask = TRUE;
+  mask_payload.previous_has_mask = _live_mask_forms_have_entries(previous_forms);
+
+  dt_iop_module_t *source_module = NULL;
+  GArray *source_forms = mask_payload.source_forms;
+  if(request != NULL && request->action == DT_LIVE_MODULE_MASK_ACTION_REUSE_SAME_SHAPES)
+  {
+    source_module = _live_snapshot_find_visible_module(dev, request->source_instance_key);
+    if(source_module == NULL)
+    {
+      g_array_unref(mask_payload.current_forms);
+      mask_payload.current_forms = _live_mask_collect_forms(previous_group);
+      mask_payload.have_current_has_mask = TRUE;
+      mask_payload.current_has_mask = mask_payload.previous_has_mask;
+      mask_payload.have_changed = TRUE;
+      mask_payload.changed = FALSE;
+      mask_payload.have_history = TRUE;
+      mask_payload.history_before = history_before;
+      mask_payload.history_after = history_before;
+      _live_snapshot_add_module_mask(builder, &mask_payload);
+      json_builder_set_member_name(builder, "reason");
+      json_builder_add_string_value(builder, "unknown-source-instance-key");
+      json_builder_set_member_name(builder, "status");
+      json_builder_add_string_value(builder, "unavailable");
+      json_builder_end_object(builder);
+      gchar *result = _live_json_builder_to_string(builder);
+      g_array_unref(mask_payload.previous_forms);
+      g_array_unref(mask_payload.source_forms);
+      g_array_unref(mask_payload.current_forms);
+      return result;
+    }
+
+    if(!_live_module_masks_supported(source_module))
+    {
+      g_array_unref(mask_payload.current_forms);
+      mask_payload.current_forms = _live_mask_collect_forms(previous_group);
+      mask_payload.have_current_has_mask = TRUE;
+      mask_payload.current_has_mask = mask_payload.previous_has_mask;
+      mask_payload.have_changed = TRUE;
+      mask_payload.changed = FALSE;
+      mask_payload.have_history = TRUE;
+      mask_payload.history_before = history_before;
+      mask_payload.history_after = history_before;
+      _live_snapshot_add_module_mask(builder, &mask_payload);
+      json_builder_set_member_name(builder, "reason");
+      json_builder_add_string_value(builder, "source-module-mask-unavailable");
+      json_builder_set_member_name(builder, "status");
+      json_builder_add_string_value(builder, "unavailable");
+      json_builder_end_object(builder);
+      gchar *result = _live_json_builder_to_string(builder);
+      g_array_unref(mask_payload.previous_forms);
+      g_array_unref(mask_payload.source_forms);
+      g_array_unref(mask_payload.current_forms);
+      return result;
+    }
+
+    dt_masks_form_t *source_group = _live_mask_group_from_module(dev, source_module);
+    source_forms = _live_mask_collect_forms(source_group);
+    g_array_unref(mask_payload.source_forms);
+    mask_payload.source_forms = source_forms;
+
+    if(!_live_mask_forms_have_entries(source_forms))
+    {
+      g_array_unref(mask_payload.current_forms);
+      mask_payload.current_forms = _live_mask_collect_forms(previous_group);
+      mask_payload.have_current_has_mask = TRUE;
+      mask_payload.current_has_mask = mask_payload.previous_has_mask;
+      mask_payload.have_changed = TRUE;
+      mask_payload.changed = FALSE;
+      mask_payload.have_history = TRUE;
+      mask_payload.history_before = history_before;
+      mask_payload.history_after = history_before;
+      _live_snapshot_add_module_mask(builder, &mask_payload);
+      json_builder_set_member_name(builder, "reason");
+      json_builder_add_string_value(builder, "source-module-mask-unavailable");
+      json_builder_set_member_name(builder, "status");
+      json_builder_add_string_value(builder, "unavailable");
+      json_builder_end_object(builder);
+      gchar *result = _live_json_builder_to_string(builder);
+      g_array_unref(mask_payload.previous_forms);
+      g_array_unref(mask_payload.source_forms);
+      g_array_unref(mask_payload.current_forms);
+      return result;
+    }
+
+    if(mask_payload.previous_has_mask && !_live_mask_forms_equal(previous_forms, source_forms))
+    {
+      g_array_unref(mask_payload.current_forms);
+      mask_payload.current_forms = _live_mask_collect_forms(previous_group);
+      mask_payload.have_current_has_mask = TRUE;
+      mask_payload.current_has_mask = mask_payload.previous_has_mask;
+      mask_payload.have_changed = TRUE;
+      mask_payload.changed = FALSE;
+      mask_payload.have_history = TRUE;
+      mask_payload.history_before = history_before;
+      mask_payload.history_after = history_before;
+      _live_snapshot_add_module_mask(builder, &mask_payload);
+      json_builder_set_member_name(builder, "reason");
+      json_builder_add_string_value(builder, "target-module-mask-not-clear");
+      json_builder_set_member_name(builder, "status");
+      json_builder_add_string_value(builder, "unavailable");
+      json_builder_end_object(builder);
+      gchar *result = _live_json_builder_to_string(builder);
+      g_array_unref(mask_payload.previous_forms);
+      g_array_unref(mask_payload.source_forms);
+      g_array_unref(mask_payload.current_forms);
+      return result;
+    }
+  }
+
+  gboolean changed = FALSE;
+  if(request != NULL && request->action == DT_LIVE_MODULE_MASK_ACTION_CLEAR_MASK)
+  {
+    if(mask_payload.previous_has_mask)
+    {
+      if(previous_group != NULL) dt_masks_form_remove(module, NULL, previous_group);
+      dt_masks_set_edit_mode(module, DT_MASKS_EDIT_OFF);
+      changed = TRUE;
+    }
+  }
+  else if(request != NULL && request->action == DT_LIVE_MODULE_MASK_ACTION_REUSE_SAME_SHAPES)
+  {
+    if(!_live_mask_forms_equal(previous_forms, source_forms))
+    {
+      dt_masks_iop_use_same_as(module, source_module);
+      dt_masks_iop_update(module);
+      dt_masks_set_edit_mode(module, DT_MASKS_EDIT_FULL);
+      changed = TRUE;
+    }
+  }
+
+  dt_masks_form_t *current_group = _live_mask_group_from_module(dev, module);
+  GArray *current_forms = _live_mask_collect_forms(current_group);
+  g_array_unref(mask_payload.current_forms);
+  mask_payload.current_forms = current_forms;
+  mask_payload.have_current_has_mask = TRUE;
+  mask_payload.current_has_mask = _live_mask_forms_have_entries(current_forms);
+  mask_payload.have_changed = TRUE;
+  mask_payload.changed = changed;
+  mask_payload.have_history = TRUE;
+  mask_payload.history_before = history_before;
+  mask_payload.history_after = dev->history_end;
+  _live_snapshot_add_module_mask(builder, &mask_payload);
+
+  if((request != NULL && request->action == DT_LIVE_MODULE_MASK_ACTION_CLEAR_MASK && mask_payload.current_has_mask)
+     || (request != NULL && request->action == DT_LIVE_MODULE_MASK_ACTION_REUSE_SAME_SHAPES
+         && !_live_mask_forms_equal(mask_payload.current_forms, mask_payload.source_forms)))
+  {
+    json_builder_set_member_name(builder, "reason");
+    json_builder_add_string_value(builder, "module-mask-failed");
+    json_builder_set_member_name(builder, "status");
+    json_builder_add_string_value(builder, "unavailable");
+    json_builder_end_object(builder);
+    gchar *result = _live_json_builder_to_string(builder);
+    g_array_unref(mask_payload.previous_forms);
+    g_array_unref(mask_payload.source_forms);
+    g_array_unref(mask_payload.current_forms);
+    return result;
+  }
+
+  g_autofree gchar *snapshot_json = _live_snapshot_to_json(dev);
+  JsonNode *snapshot_root = _live_json_copy_object_root(snapshot_json);
+  if(snapshot_root == NULL)
+  {
+    json_builder_set_member_name(builder, "reason");
+    json_builder_add_string_value(builder, "snapshot-unavailable");
+    json_builder_set_member_name(builder, "status");
+    json_builder_add_string_value(builder, "unavailable");
+    json_builder_end_object(builder);
+    gchar *result = _live_json_builder_to_string(builder);
+    g_array_unref(mask_payload.previous_forms);
+    g_array_unref(mask_payload.source_forms);
+    g_array_unref(mask_payload.current_forms);
+    return result;
+  }
+
+  json_builder_set_member_name(builder, "snapshot");
+  json_builder_add_value(builder, snapshot_root);
+  json_builder_set_member_name(builder, "status");
+  json_builder_add_string_value(builder, "ok");
+  json_builder_end_object(builder);
+  gchar *result = _live_json_builder_to_string(builder);
+  g_array_unref(mask_payload.previous_forms);
+  g_array_unref(mask_payload.source_forms);
+  g_array_unref(mask_payload.current_forms);
+  return result;
 }
 
 static dt_live_module_reorder_check_t _live_module_instance_check_reorder(dt_develop_t *dev,
@@ -2099,6 +2661,24 @@ static int live_apply_module_instance_blend_cb(lua_State *L)
   return 1;
 }
 
+static int live_apply_module_instance_mask_cb(lua_State *L)
+{
+  dt_develop_t *dev = darktable.develop;
+  const gchar *instance_key = luaL_checkstring(L, 1);
+  const gchar *mask_json = luaL_checkstring(L, 2);
+  dt_live_module_mask_request_t request = { 0 };
+  if(!_live_parse_module_instance_mask_request(mask_json, &request))
+  {
+    return luaL_error(L, "invalid mask request");
+  }
+
+  g_autofree gchar *source_instance_key = request.source_instance_key;
+  g_autofree gchar *response_json =
+    _live_apply_module_instance_mask_to_json(dev, instance_key, &request);
+  lua_pushstring(L, response_json ? response_json : "{}");
+  return 1;
+}
+
 #endif
 
 // helpers to let us get the pointer's zoom position only when actually
@@ -2166,6 +2746,11 @@ void init(dt_view_t *self)
   dt_lua_gtk_wrap(L);
   lua_pushcclosure(L, dt_lua_type_member_common, 1);
   dt_lua_type_register_const_type(L, my_type, "live_apply_module_instance_blend");
+  lua_pushlightuserdata(L, self);
+  lua_pushcclosure(L, live_apply_module_instance_mask_cb, 1);
+  dt_lua_gtk_wrap(L);
+  lua_pushcclosure(L, dt_lua_type_member_common, 1);
+  dt_lua_type_register_const_type(L, my_type, "live_apply_module_instance_mask");
 #endif
 }
 
