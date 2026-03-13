@@ -415,6 +415,267 @@ static gchar *_live_snapshot_to_json(dt_develop_t *dev)
   return g_strdup(json);
 }
 
+static gchar *_live_json_builder_to_string(JsonBuilder *builder)
+{
+  JsonNode *root = json_builder_get_root(builder);
+  g_autoptr(JsonGenerator) generator = json_generator_new();
+  json_generator_set_root(generator, root);
+  json_generator_set_pretty(generator, FALSE);
+  g_autofree gchar *json = json_generator_to_data(generator, NULL);
+  json_node_free(root);
+  return g_strdup(json);
+}
+
+static JsonNode *_live_json_copy_object_root(const gchar *json)
+{
+  if(json == NULL || json[0] == '\0') return NULL;
+
+  g_autoptr(JsonParser) parser = json_parser_new();
+  if(!json_parser_load_from_data(parser, json, -1, NULL)) return NULL;
+
+  JsonNode *root = json_parser_get_root(parser);
+  if(root == NULL || !JSON_NODE_HOLDS_OBJECT(root)) return NULL;
+
+  return json_node_copy(root);
+}
+
+static gboolean _live_snapshot_add_active_image(JsonBuilder *builder, dt_develop_t *dev)
+{
+  if(builder == NULL || dev == NULL || dev->image_storage.id == NO_IMGID) return FALSE;
+
+  const dt_image_t *image = dt_image_cache_get(dev->image_storage.id, 'r');
+  if(image == NULL) return FALSE;
+
+  g_autofree gchar *source_asset_path = g_build_filename(image->path, image->filename, NULL);
+
+  json_builder_set_member_name(builder, "activeImage");
+  json_builder_begin_object(builder);
+  json_builder_set_member_name(builder, "imageId");
+  json_builder_add_int_value(builder, image->id);
+  json_builder_set_member_name(builder, "directoryPath");
+  json_builder_add_string_value(builder, image->path);
+  json_builder_set_member_name(builder, "fileName");
+  json_builder_add_string_value(builder, image->filename);
+  json_builder_set_member_name(builder, "sourceAssetPath");
+  json_builder_add_string_value(builder, source_asset_path);
+  json_builder_end_object(builder);
+
+  dt_image_cache_read_release(image);
+  return TRUE;
+}
+
+static dt_iop_module_t *_live_snapshot_find_visible_module(dt_develop_t *dev, const gchar *instance_key)
+{
+  if(dev == NULL || instance_key == NULL || instance_key[0] == '\0') return NULL;
+
+  for(const GList *iter = dev->iop; iter; iter = g_list_next(iter))
+  {
+    dt_iop_module_t *module = iter->data;
+    if(module == NULL || dt_iop_is_hidden(module)) continue;
+
+    g_autofree gchar *candidate_key =
+      _live_snapshot_instance_key(module->op, module->instance, module->multi_priority, module->multi_name);
+    if(g_strcmp0(candidate_key, instance_key) == 0) return module;
+  }
+
+  return NULL;
+}
+
+static gboolean _live_module_instance_action_to_enabled(const gchar *action, gboolean *enabled_out)
+{
+  if(g_strcmp0(action, "enable") == 0)
+  {
+    if(enabled_out != NULL) *enabled_out = TRUE;
+    return TRUE;
+  }
+  if(g_strcmp0(action, "disable") == 0)
+  {
+    if(enabled_out != NULL) *enabled_out = FALSE;
+    return TRUE;
+  }
+  return FALSE;
+}
+
+static void _live_snapshot_add_module_action(JsonBuilder *builder,
+                                             const gchar *instance_key,
+                                             const gchar *action,
+                                             const gboolean have_requested_enabled,
+                                             const gboolean requested_enabled,
+                                             dt_iop_module_t *module,
+                                             const gboolean have_previous_enabled,
+                                             const gboolean previous_enabled,
+                                             const gboolean have_current_enabled,
+                                             const gboolean current_enabled,
+                                             const gint history_before,
+                                             const gint history_after)
+{
+  json_builder_set_member_name(builder, "moduleAction");
+  json_builder_begin_object(builder);
+  json_builder_set_member_name(builder, "targetInstanceKey");
+  json_builder_add_string_value(builder, instance_key ? instance_key : "");
+  json_builder_set_member_name(builder, "action");
+  json_builder_add_string_value(builder, action ? action : "");
+
+  if(have_requested_enabled)
+  {
+    json_builder_set_member_name(builder, "requestedEnabled");
+    json_builder_add_boolean_value(builder, requested_enabled);
+  }
+
+  if(module != NULL)
+  {
+    json_builder_set_member_name(builder, "moduleOp");
+    json_builder_add_string_value(builder, module->op);
+    json_builder_set_member_name(builder, "iopOrder");
+    json_builder_add_int_value(builder, module->iop_order);
+    json_builder_set_member_name(builder, "multiPriority");
+    json_builder_add_int_value(builder, module->multi_priority);
+    json_builder_set_member_name(builder, "multiName");
+    json_builder_add_string_value(builder, module->multi_name);
+  }
+
+  if(have_previous_enabled)
+  {
+    json_builder_set_member_name(builder, "previousEnabled");
+    json_builder_add_boolean_value(builder, previous_enabled);
+  }
+
+  if(have_current_enabled)
+  {
+    json_builder_set_member_name(builder, "currentEnabled");
+    json_builder_add_boolean_value(builder, current_enabled);
+  }
+
+  if(have_previous_enabled && have_current_enabled)
+  {
+    json_builder_set_member_name(builder, "changed");
+    json_builder_add_boolean_value(builder, previous_enabled != current_enabled);
+    json_builder_set_member_name(builder, "historyBefore");
+    json_builder_add_int_value(builder, history_before);
+    json_builder_set_member_name(builder, "historyAfter");
+    json_builder_add_int_value(builder, history_after);
+    json_builder_set_member_name(builder, "requestedHistoryEnd");
+    json_builder_add_int_value(builder, history_after);
+  }
+
+  json_builder_end_object(builder);
+}
+
+static gchar *_live_apply_module_instance_action_to_json(dt_develop_t *dev,
+                                                         const gchar *instance_key,
+                                                         const gchar *action)
+{
+  g_autoptr(JsonBuilder) builder = json_builder_new();
+  json_builder_begin_object(builder);
+
+  gboolean requested_enabled = FALSE;
+  const gboolean supported_action = _live_module_instance_action_to_enabled(action, &requested_enabled);
+
+  if(dt_view_get_current() != DT_VIEW_DARKROOM)
+  {
+    _live_snapshot_add_module_action(builder, instance_key, action, supported_action, requested_enabled,
+                                     NULL, FALSE, FALSE, FALSE, FALSE, 0, 0);
+    json_builder_set_member_name(builder, "reason");
+    json_builder_add_string_value(builder, "unsupported-view");
+    json_builder_set_member_name(builder, "status");
+    json_builder_add_string_value(builder, "unavailable");
+    json_builder_end_object(builder);
+    return _live_json_builder_to_string(builder);
+  }
+
+  if(dev == NULL || dev->image_storage.id == NO_IMGID)
+  {
+    _live_snapshot_add_module_action(builder, instance_key, action, supported_action, requested_enabled,
+                                     NULL, FALSE, FALSE, FALSE, FALSE, 0, 0);
+    json_builder_set_member_name(builder, "reason");
+    json_builder_add_string_value(builder, "no-active-image");
+    json_builder_set_member_name(builder, "status");
+    json_builder_add_string_value(builder, "unavailable");
+    json_builder_end_object(builder);
+    return _live_json_builder_to_string(builder);
+  }
+
+  _live_snapshot_add_active_image(builder, dev);
+
+  if(!supported_action)
+  {
+    _live_snapshot_add_module_action(builder, instance_key, action, FALSE, FALSE, NULL, FALSE, FALSE,
+                                     FALSE, FALSE, 0, 0);
+    json_builder_set_member_name(builder, "reason");
+    json_builder_add_string_value(builder, "unsupported-module-action");
+    json_builder_set_member_name(builder, "status");
+    json_builder_add_string_value(builder, "unavailable");
+    json_builder_end_object(builder);
+    return _live_json_builder_to_string(builder);
+  }
+
+  dt_iop_module_t *module = _live_snapshot_find_visible_module(dev, instance_key);
+  if(module == NULL)
+  {
+    _live_snapshot_add_module_action(builder, instance_key, action, TRUE, requested_enabled, NULL, FALSE,
+                                     FALSE, FALSE, FALSE, 0, 0);
+    json_builder_set_member_name(builder, "reason");
+    json_builder_add_string_value(builder, "unknown-instance-key");
+    json_builder_set_member_name(builder, "status");
+    json_builder_add_string_value(builder, "unavailable");
+    json_builder_end_object(builder);
+    return _live_json_builder_to_string(builder);
+  }
+
+  const gboolean previous_enabled = module->enabled;
+  const gint history_before = dev->history_end;
+
+  if(module->hide_enable_button || module->off == NULL)
+  {
+    _live_snapshot_add_module_action(builder, instance_key, action, TRUE, requested_enabled, module, TRUE,
+                                     previous_enabled, TRUE, module->enabled, history_before, history_before);
+    json_builder_set_member_name(builder, "reason");
+    json_builder_add_string_value(builder, "unsupported-module-state");
+    json_builder_set_member_name(builder, "status");
+    json_builder_add_string_value(builder, "unavailable");
+    json_builder_end_object(builder);
+    return _live_json_builder_to_string(builder);
+  }
+
+  if(previous_enabled != requested_enabled)
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(module->off), requested_enabled);
+
+  const gboolean current_enabled = module->enabled;
+  const gint history_after = dev->history_end;
+  g_autofree gchar *snapshot_json = _live_snapshot_to_json(dev);
+
+  _live_snapshot_add_module_action(builder, instance_key, action, TRUE, requested_enabled, module, TRUE,
+                                   previous_enabled, TRUE, current_enabled, history_before, history_after);
+
+  if(current_enabled != requested_enabled)
+  {
+    json_builder_set_member_name(builder, "reason");
+    json_builder_add_string_value(builder, "module-action-failed");
+    json_builder_set_member_name(builder, "status");
+    json_builder_add_string_value(builder, "unavailable");
+    json_builder_end_object(builder);
+    return _live_json_builder_to_string(builder);
+  }
+
+  JsonNode *snapshot_root = _live_json_copy_object_root(snapshot_json);
+  if(snapshot_root == NULL)
+  {
+    json_builder_set_member_name(builder, "reason");
+    json_builder_add_string_value(builder, "snapshot-unavailable");
+    json_builder_set_member_name(builder, "status");
+    json_builder_add_string_value(builder, "unavailable");
+    json_builder_end_object(builder);
+    return _live_json_builder_to_string(builder);
+  }
+
+  json_builder_set_member_name(builder, "snapshot");
+  json_builder_add_value(builder, snapshot_root);
+  json_builder_set_member_name(builder, "status");
+  json_builder_add_string_value(builder, "ok");
+  json_builder_end_object(builder);
+  return _live_json_builder_to_string(builder);
+}
+
 static int display_image_cb(lua_State *L)
 {
   dt_develop_t *dev = darktable.develop;
@@ -438,6 +699,16 @@ static int live_snapshot_cb(lua_State *L)
   dt_develop_t *dev = darktable.develop;
   g_autofree gchar *snapshot_json = _live_snapshot_to_json(dev);
   lua_pushstring(L, snapshot_json ? snapshot_json : "{}");
+  return 1;
+}
+
+static int live_apply_module_instance_action_cb(lua_State *L)
+{
+  dt_develop_t *dev = darktable.develop;
+  const gchar *instance_key = luaL_checkstring(L, 1);
+  const gchar *action = luaL_checkstring(L, 2);
+  g_autofree gchar *response_json = _live_apply_module_instance_action_to_json(dev, instance_key, action);
+  lua_pushstring(L, response_json ? response_json : "{}");
   return 1;
 }
 
@@ -498,6 +769,11 @@ void init(dt_view_t *self)
   dt_lua_gtk_wrap(L);
   lua_pushcclosure(L, dt_lua_type_member_common, 1);
   dt_lua_type_register_const_type(L, my_type, "live_snapshot");
+  lua_pushlightuserdata(L, self);
+  lua_pushcclosure(L, live_apply_module_instance_action_cb, 1);
+  dt_lua_gtk_wrap(L);
+  lua_pushcclosure(L, dt_lua_type_member_common, 1);
+  dt_lua_type_register_const_type(L, my_type, "live_apply_module_instance_action");
 #endif
 }
 

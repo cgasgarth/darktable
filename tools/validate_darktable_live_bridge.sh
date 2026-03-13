@@ -188,6 +188,49 @@ wait_for_remote_lua
 
 initial_json=$(wait_for_session_payload "$ready_attempts")
 snapshot_json=$(run_bridge get-snapshot)
+module_instance_target_json=$(python3 - "$snapshot_json" <<'PY'
+import json, sys
+snapshot = json.loads(sys.argv[1])
+module_stack = ((snapshot.get('snapshot') or {}).get('moduleStack') or [])
+target = None
+for item in module_stack:
+    if not isinstance(item, dict):
+        continue
+    if not isinstance(item.get('instanceKey'), str) or not isinstance(item.get('enabled'), bool):
+        continue
+    if item.get('moduleOp') == 'exposure':
+        target = item
+        break
+    if target is None:
+        target = item
+if target is None:
+    raise SystemExit('no module stack target available')
+action = 'disable' if target['enabled'] else 'enable'
+revert = 'enable' if action == 'disable' else 'disable'
+print(json.dumps({
+    'instanceKey': target['instanceKey'],
+    'moduleOp': target.get('moduleOp'),
+    'previousEnabled': target['enabled'],
+    'action': action,
+    'revertAction': revert,
+}, separators=(',', ':')))
+PY
+)
+module_instance_key=$(python3 - "$module_instance_target_json" <<'PY'
+import json, sys
+print(json.loads(sys.argv[1])['instanceKey'])
+PY
+)
+module_instance_action=$(python3 - "$module_instance_target_json" <<'PY'
+import json, sys
+print(json.loads(sys.argv[1])['action'])
+PY
+)
+module_instance_revert_action=$(python3 - "$module_instance_target_json" <<'PY'
+import json, sys
+print(json.loads(sys.argv[1])['revertAction'])
+PY
+)
 list_json=$(run_bridge list-controls)
 get_control_json=$(run_bridge get-control exposure.exposure)
 set_json=$(run_bridge set-exposure "$requested_exposure")
@@ -195,11 +238,16 @@ post_set_exposure_json=$(wait_for_session_payload "$post_set_attempts" "$request
 set_control_json=$(run_bridge set-control exposure.exposure "$requested_control_exposure")
 post_set_control_json=$(wait_for_session_payload "$post_set_attempts" "$requested_control_exposure")
 unsupported_control_json=$(run_bridge get-control unsupported.control)
+module_instance_action_json=$(run_bridge apply-module-instance-action "$module_instance_key" "$module_instance_action")
+module_instance_revert_json=$(run_bridge apply-module-instance-action "$module_instance_key" "$module_instance_revert_action")
+unsupported_module_action_json=$(run_bridge apply-module-instance-action "$module_instance_key" unsupported-action)
+unknown_module_instance_json=$(run_bridge apply-module-instance-action unknown#-1#-1#missing enable)
 
 switch_to_lighttable
 unsupported_view_snapshot_json=$(run_bridge get-snapshot)
 unsupported_view_get_control_json=$(run_bridge get-control exposure.exposure)
 unsupported_view_set_control_json=$(run_bridge set-control exposure.exposure "$requested_control_exposure")
+unsupported_view_module_instance_action_json=$(run_bridge apply-module-instance-action "$module_instance_key" "$module_instance_action")
 switch_to_darkroom
 wait_for_session_payload "$ready_attempts" >/dev/null
 
@@ -215,23 +263,29 @@ if run_bridge set-exposure 4.5 >/dev/null 2>&1; then
   fail "set-exposure accepted out-of-range exposure"
 fi
 
-python3 - "$initial_json" "$snapshot_json" "$list_json" "$get_control_json" "$set_json" "$post_set_exposure_json" "$set_control_json" "$post_set_control_json" "$unsupported_control_json" "$unsupported_view_snapshot_json" "$unsupported_view_get_control_json" "$unsupported_view_set_control_json" "$requested_exposure" "$requested_control_exposure" "$asset_path" <<'PY'
+python3 - "$initial_json" "$snapshot_json" "$module_instance_target_json" "$list_json" "$get_control_json" "$set_json" "$post_set_exposure_json" "$set_control_json" "$post_set_control_json" "$unsupported_control_json" "$module_instance_action_json" "$module_instance_revert_json" "$unsupported_module_action_json" "$unknown_module_instance_json" "$unsupported_view_snapshot_json" "$unsupported_view_get_control_json" "$unsupported_view_set_control_json" "$unsupported_view_module_instance_action_json" "$requested_exposure" "$requested_control_exposure" "$asset_path" <<'PY'
 import json, math, os, sys
 initial = json.loads(sys.argv[1])
 snapshot = json.loads(sys.argv[2])
-listed = json.loads(sys.argv[3])
-get_control = json.loads(sys.argv[4])
-set_payload = json.loads(sys.argv[5])
-post_set_exposure = json.loads(sys.argv[6])
-set_control = json.loads(sys.argv[7])
-post_set_control = json.loads(sys.argv[8])
-unsupported = json.loads(sys.argv[9])
-unsupported_view_snapshot = json.loads(sys.argv[10])
-unsupported_view_get = json.loads(sys.argv[11])
-unsupported_view_set = json.loads(sys.argv[12])
-requested = float(sys.argv[13])
-requested_control = float(sys.argv[14])
-asset = os.path.realpath(sys.argv[15])
+module_instance_target = json.loads(sys.argv[3])
+listed = json.loads(sys.argv[4])
+get_control = json.loads(sys.argv[5])
+set_payload = json.loads(sys.argv[6])
+post_set_exposure = json.loads(sys.argv[7])
+set_control = json.loads(sys.argv[8])
+post_set_control = json.loads(sys.argv[9])
+unsupported = json.loads(sys.argv[10])
+module_instance_action = json.loads(sys.argv[11])
+module_instance_revert = json.loads(sys.argv[12])
+unsupported_module_action = json.loads(sys.argv[13])
+unknown_module_instance = json.loads(sys.argv[14])
+unsupported_view_snapshot = json.loads(sys.argv[15])
+unsupported_view_get = json.loads(sys.argv[16])
+unsupported_view_set = json.loads(sys.argv[17])
+unsupported_view_module_instance_action = json.loads(sys.argv[18])
+requested = float(sys.argv[19])
+requested_control = float(sys.argv[20])
+asset = os.path.realpath(sys.argv[21])
 
 EXPECTED_CONTROL_ID = 'exposure.exposure'
 
@@ -284,6 +338,31 @@ def expect_snapshot_item(name, item, expect_index):
         if key not in item:
             raise SystemExit(f'{name} missing {key}: {item}')
     expect_params_shape(f'{name} params', item.get('params'))
+
+def expect_module_instance_response(name, payload, target_key, action, expected_previous, expected_current):
+    expect_ok(name, payload)
+    action_payload = payload.get('moduleAction') or {}
+    if action_payload.get('targetInstanceKey') != target_key:
+        raise SystemExit(f'{name} target instance mismatch: {payload}')
+    if action_payload.get('action') != action:
+        raise SystemExit(f'{name} action mismatch: {payload}')
+    if action_payload.get('requestedEnabled') != expected_current:
+        raise SystemExit(f'{name} requested enabled mismatch: {payload}')
+    if action_payload.get('previousEnabled') != expected_previous:
+        raise SystemExit(f'{name} previous enabled mismatch: {payload}')
+    if action_payload.get('currentEnabled') != expected_current:
+        raise SystemExit(f'{name} current enabled mismatch: {payload}')
+    snapshot_payload = payload.get('snapshot') or {}
+    module_stack = snapshot_payload.get('moduleStack') or []
+    matching_items = [item for item in module_stack if isinstance(item, dict) and item.get('instanceKey') == target_key]
+    if len(matching_items) != 1:
+        raise SystemExit(f'{name} target snapshot item mismatch: {payload}')
+    if matching_items[0].get('enabled') != expected_current:
+        raise SystemExit(f'{name} target snapshot enabled mismatch: {payload}')
+    if not isinstance(action_payload.get('historyBefore'), int) or not isinstance(action_payload.get('historyAfter'), int):
+        raise SystemExit(f'{name} history markers missing: {payload}')
+    if action_payload.get('requestedHistoryEnd') != action_payload.get('historyAfter'):
+        raise SystemExit(f'{name} requested history end mismatch: {payload}')
 
 expect_ok('initial', initial)
 expect_ok('get-snapshot', snapshot)
@@ -361,6 +440,25 @@ for name, payload in (
         raise SystemExit(f'{name} requested control mismatch: {payload}')
     if payload.get('session', {}).get('view') != 'lighttable':
         raise SystemExit(f'{name} session mismatch: {payload}')
+module_target_key = module_instance_target.get('instanceKey')
+module_target_previous = module_instance_target.get('previousEnabled')
+module_target_action = module_instance_target.get('action')
+module_target_current = (module_target_action == 'enable')
+module_target_revert_action = module_instance_target.get('revertAction')
+expect_module_instance_response('apply-module-instance-action', module_instance_action, module_target_key, module_target_action, module_target_previous, module_target_current)
+expect_module_instance_response('apply-module-instance-action revert', module_instance_revert, module_target_key, module_target_revert_action, module_target_current, module_target_previous)
+if unsupported_module_action.get('status') != 'unavailable' or unsupported_module_action.get('reason') != 'unsupported-module-action':
+    raise SystemExit(f'unsupported module action response mismatch: {unsupported_module_action}')
+if (unsupported_module_action.get('moduleAction') or {}).get('targetInstanceKey') != module_target_key:
+    raise SystemExit(f'unsupported module action target mismatch: {unsupported_module_action}')
+if unknown_module_instance.get('status') != 'unavailable' or unknown_module_instance.get('reason') != 'unknown-instance-key':
+    raise SystemExit(f'unknown module instance response mismatch: {unknown_module_instance}')
+if (unknown_module_instance.get('moduleAction') or {}).get('targetInstanceKey') != 'unknown#-1#-1#missing':
+    raise SystemExit(f'unknown module instance target mismatch: {unknown_module_instance}')
+if unsupported_view_module_instance_action.get('status') != 'unavailable' or unsupported_view_module_instance_action.get('reason') != 'unsupported-view':
+    raise SystemExit(f'unsupported-view module instance response mismatch: {unsupported_view_module_instance_action}')
+if unsupported_view_module_instance_action.get('session', {}).get('view') != 'lighttable':
+    raise SystemExit(f'unsupported-view module instance session mismatch: {unsupported_view_module_instance_action}')
 print('initial:', json.dumps(initial, separators=(",", ":")))
 print('get-snapshot:', json.dumps(snapshot, separators=(",", ":")))
 print('list-controls:', json.dumps(listed, separators=(",", ":")))
@@ -369,9 +467,14 @@ print('set-exposure:', json.dumps(set_payload, separators=(",", ":")))
 print('post-set-exposure:', json.dumps(post_set_exposure, separators=(",", ":")))
 print('set-control:', json.dumps(set_control, separators=(",", ":")))
 print('post-set-control:', json.dumps(post_set_control, separators=(",", ":")))
+print('apply-module-instance-action:', json.dumps(module_instance_action, separators=(",", ":")))
+print('apply-module-instance-action-revert:', json.dumps(module_instance_revert, separators=(",", ":")))
+print('unsupported-module-action:', json.dumps(unsupported_module_action, separators=(",", ":")))
+print('unknown-module-instance:', json.dumps(unknown_module_instance, separators=(",", ":")))
 print('unsupported-control:', json.dumps(unsupported, separators=(",", ":")))
 print('unsupported-view-get-snapshot:', json.dumps(unsupported_view_snapshot, separators=(",", ":")))
 print('unsupported-view-get-control:', json.dumps(unsupported_view_get, separators=(",", ":")))
 print('unsupported-view-set-control:', json.dumps(unsupported_view_set, separators=(",", ":")))
-print('result: post-set get-session reports both requested exposure targets')
+print('unsupported-view-apply-module-instance-action:', json.dumps(unsupported_view_module_instance_action, separators=(",", ":")))
+print('result: exposure controls and module-instance enable/disable actions validated')
 PY
