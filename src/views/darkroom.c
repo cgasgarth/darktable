@@ -69,6 +69,7 @@
 #include <gdk/gdkkeysyms.h>
 #include <glib.h>
 #include <json-glib/json-glib.h>
+#include <limits.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -446,14 +447,16 @@ static gboolean _live_snapshot_add_active_image(JsonBuilder *builder, dt_develop
   const dt_image_t *image = dt_image_cache_get(dev->image_storage.id, 'r');
   if(image == NULL) return FALSE;
 
-  g_autofree gchar *source_asset_path = g_build_filename(image->path, image->filename, NULL);
+  char directory_path[PATH_MAX] = { 0 };
+  dt_image_film_roll_directory(image, directory_path, sizeof(directory_path));
+  g_autofree gchar *source_asset_path = g_build_filename(directory_path, image->filename, NULL);
 
   json_builder_set_member_name(builder, "activeImage");
   json_builder_begin_object(builder);
   json_builder_set_member_name(builder, "imageId");
   json_builder_add_int_value(builder, image->id);
   json_builder_set_member_name(builder, "directoryPath");
-  json_builder_add_string_value(builder, image->path);
+  json_builder_add_string_value(builder, directory_path);
   json_builder_set_member_name(builder, "fileName");
   json_builder_add_string_value(builder, image->filename);
   json_builder_set_member_name(builder, "sourceAssetPath");
@@ -481,19 +484,33 @@ static dt_iop_module_t *_live_snapshot_find_visible_module(dt_develop_t *dev, co
   return NULL;
 }
 
-static gboolean _live_module_instance_action_to_enabled(const gchar *action, gboolean *enabled_out)
+typedef enum dt_live_module_instance_action_t
+{
+  DT_LIVE_MODULE_INSTANCE_ACTION_INVALID = 0,
+  DT_LIVE_MODULE_INSTANCE_ACTION_ENABLE,
+  DT_LIVE_MODULE_INSTANCE_ACTION_DISABLE,
+  DT_LIVE_MODULE_INSTANCE_ACTION_CREATE,
+  DT_LIVE_MODULE_INSTANCE_ACTION_DUPLICATE,
+} dt_live_module_instance_action_t;
+
+static dt_live_module_instance_action_t _live_module_instance_action_from_string(const gchar *action,
+                                                                                 gboolean *enabled_out)
 {
   if(g_strcmp0(action, "enable") == 0)
   {
     if(enabled_out != NULL) *enabled_out = TRUE;
-    return TRUE;
+    return DT_LIVE_MODULE_INSTANCE_ACTION_ENABLE;
   }
   if(g_strcmp0(action, "disable") == 0)
   {
     if(enabled_out != NULL) *enabled_out = FALSE;
-    return TRUE;
+    return DT_LIVE_MODULE_INSTANCE_ACTION_DISABLE;
   }
-  return FALSE;
+  if(g_strcmp0(action, "create") == 0)
+    return DT_LIVE_MODULE_INSTANCE_ACTION_CREATE;
+  if(g_strcmp0(action, "duplicate") == 0)
+    return DT_LIVE_MODULE_INSTANCE_ACTION_DUPLICATE;
+  return DT_LIVE_MODULE_INSTANCE_ACTION_INVALID;
 }
 
 static void _live_snapshot_add_module_action(JsonBuilder *builder,
@@ -506,8 +523,10 @@ static void _live_snapshot_add_module_action(JsonBuilder *builder,
                                              const gboolean previous_enabled,
                                              const gboolean have_current_enabled,
                                              const gboolean current_enabled,
+                                             const gboolean have_history,
                                              const gint history_before,
-                                             const gint history_after)
+                                             const gint history_after,
+                                             dt_iop_module_t *result_module)
 {
   json_builder_set_member_name(builder, "moduleAction");
   json_builder_begin_object(builder);
@@ -534,6 +553,26 @@ static void _live_snapshot_add_module_action(JsonBuilder *builder,
     json_builder_add_string_value(builder, module->multi_name);
   }
 
+  if(result_module != NULL)
+  {
+    g_autofree gchar *result_instance_key =
+      _live_snapshot_instance_key(result_module->op, result_module->instance,
+                                  result_module->multi_priority, result_module->multi_name);
+    json_builder_set_member_name(builder, "resultInstanceKey");
+    json_builder_add_string_value(builder, result_instance_key);
+    if(module == NULL)
+    {
+      json_builder_set_member_name(builder, "moduleOp");
+      json_builder_add_string_value(builder, result_module->op);
+      json_builder_set_member_name(builder, "iopOrder");
+      json_builder_add_int_value(builder, result_module->iop_order);
+      json_builder_set_member_name(builder, "multiPriority");
+      json_builder_add_int_value(builder, result_module->multi_priority);
+      json_builder_set_member_name(builder, "multiName");
+      json_builder_add_string_value(builder, result_module->multi_name);
+    }
+  }
+
   if(have_previous_enabled)
   {
     json_builder_set_member_name(builder, "previousEnabled");
@@ -550,6 +589,10 @@ static void _live_snapshot_add_module_action(JsonBuilder *builder,
   {
     json_builder_set_member_name(builder, "changed");
     json_builder_add_boolean_value(builder, previous_enabled != current_enabled);
+  }
+
+  if(have_history)
+  {
     json_builder_set_member_name(builder, "historyBefore");
     json_builder_add_int_value(builder, history_before);
     json_builder_set_member_name(builder, "historyAfter");
@@ -561,6 +604,83 @@ static void _live_snapshot_add_module_action(JsonBuilder *builder,
   json_builder_end_object(builder);
 }
 
+static dt_iop_module_t *_live_create_module_instance(dt_iop_module_t *base, const gboolean copy_params)
+{
+  if(base == NULL) return NULL;
+
+  dt_dev_add_history_item(base->dev, base, FALSE);
+
+  if(darktable.gui != NULL) ++darktable.gui->reset;
+  dt_iop_module_t *module = dt_dev_module_duplicate(base->dev, base);
+  if(darktable.gui != NULL) --darktable.gui->reset;
+  if(module == NULL) return NULL;
+
+  if(!dt_iop_is_hidden(module))
+  {
+    dt_iop_gui_init(module);
+    dt_iop_gui_set_expander(module);
+    dt_iop_gui_set_expanded(module, FALSE, FALSE);
+
+    if(base->expander != NULL && module->expander != NULL)
+    {
+      GList *modules = module->dev->iop;
+      int pos_module = 0;
+      int pos_base = 0;
+      int pos = 0;
+
+      while(modules)
+      {
+        dt_iop_module_t *current = modules->data;
+        if(current == module)
+          pos_module = pos;
+        else if(current == base)
+          pos_base = pos;
+        modules = g_list_next(modules);
+        pos++;
+      }
+
+      GValue position = G_VALUE_INIT;
+      g_value_init(&position, G_TYPE_INT);
+      gtk_container_child_get_property(
+          GTK_CONTAINER(dt_ui_get_container(darktable.gui->ui, DT_UI_CONTAINER_PANEL_RIGHT_CENTER)),
+          base->expander, "position", &position);
+      gtk_box_reorder_child(
+          dt_ui_get_container(darktable.gui->ui, DT_UI_CONTAINER_PANEL_RIGHT_CENTER),
+          module->expander, g_value_get_int(&position) + pos_base - pos_module + 1);
+      g_value_unset(&position);
+    }
+
+    dt_iop_reload_defaults(module);
+
+    if(copy_params)
+    {
+      memcpy(module->params, base->params, module->params_size);
+      if(module->flags() & IOP_FLAGS_SUPPORTS_BLENDING)
+      {
+        dt_iop_commit_blend_params(module, base->blend_params);
+        if(dt_is_valid_maskid(base->blend_params->mask_id))
+        {
+          module->blend_params->mask_id = NO_MASKID;
+          dt_masks_iop_use_same_as(module, base);
+        }
+      }
+    }
+
+    dt_dev_add_history_item(module->dev, module, TRUE);
+    dt_iop_gui_update_blending(module);
+    dt_iop_gui_update(module);
+  }
+
+  dt_iop_connect_accels_multi(base->so);
+  if(module->dev->gui_attached)
+  {
+    dt_dev_pixelpipe_rebuild(module->dev);
+  }
+  dt_dev_modulegroups_update_visibility(module->dev);
+
+  return module;
+}
+
 static gchar *_live_apply_module_instance_action_to_json(dt_develop_t *dev,
                                                          const gchar *instance_key,
                                                          const gchar *action)
@@ -569,12 +689,14 @@ static gchar *_live_apply_module_instance_action_to_json(dt_develop_t *dev,
   json_builder_begin_object(builder);
 
   gboolean requested_enabled = FALSE;
-  const gboolean supported_action = _live_module_instance_action_to_enabled(action, &requested_enabled);
+  const dt_live_module_instance_action_t action_kind =
+    _live_module_instance_action_from_string(action, &requested_enabled);
+  const gboolean supported_action = action_kind != DT_LIVE_MODULE_INSTANCE_ACTION_INVALID;
 
   if(dt_view_get_current() != DT_VIEW_DARKROOM)
   {
     _live_snapshot_add_module_action(builder, instance_key, action, supported_action, requested_enabled,
-                                     NULL, FALSE, FALSE, FALSE, FALSE, 0, 0);
+                                     NULL, FALSE, FALSE, FALSE, FALSE, FALSE, 0, 0, NULL);
     json_builder_set_member_name(builder, "reason");
     json_builder_add_string_value(builder, "unsupported-view");
     json_builder_set_member_name(builder, "status");
@@ -586,7 +708,7 @@ static gchar *_live_apply_module_instance_action_to_json(dt_develop_t *dev,
   if(dev == NULL || dev->image_storage.id == NO_IMGID)
   {
     _live_snapshot_add_module_action(builder, instance_key, action, supported_action, requested_enabled,
-                                     NULL, FALSE, FALSE, FALSE, FALSE, 0, 0);
+                                     NULL, FALSE, FALSE, FALSE, FALSE, FALSE, 0, 0, NULL);
     json_builder_set_member_name(builder, "reason");
     json_builder_add_string_value(builder, "no-active-image");
     json_builder_set_member_name(builder, "status");
@@ -600,7 +722,7 @@ static gchar *_live_apply_module_instance_action_to_json(dt_develop_t *dev,
   if(!supported_action)
   {
     _live_snapshot_add_module_action(builder, instance_key, action, FALSE, FALSE, NULL, FALSE, FALSE,
-                                     FALSE, FALSE, 0, 0);
+                                     FALSE, FALSE, FALSE, 0, 0, NULL);
     json_builder_set_member_name(builder, "reason");
     json_builder_add_string_value(builder, "unsupported-module-action");
     json_builder_set_member_name(builder, "status");
@@ -613,7 +735,7 @@ static gchar *_live_apply_module_instance_action_to_json(dt_develop_t *dev,
   if(module == NULL)
   {
     _live_snapshot_add_module_action(builder, instance_key, action, TRUE, requested_enabled, NULL, FALSE,
-                                     FALSE, FALSE, FALSE, 0, 0);
+                                     FALSE, FALSE, FALSE, FALSE, 0, 0, NULL);
     json_builder_set_member_name(builder, "reason");
     json_builder_add_string_value(builder, "unknown-instance-key");
     json_builder_set_member_name(builder, "status");
@@ -625,10 +747,65 @@ static gchar *_live_apply_module_instance_action_to_json(dt_develop_t *dev,
   const gboolean previous_enabled = module->enabled;
   const gint history_before = dev->history_end;
 
+  if(action_kind == DT_LIVE_MODULE_INSTANCE_ACTION_CREATE
+     || action_kind == DT_LIVE_MODULE_INSTANCE_ACTION_DUPLICATE)
+  {
+    if(module->flags() & IOP_FLAGS_ONE_INSTANCE)
+    {
+      _live_snapshot_add_module_action(builder, instance_key, action, FALSE, FALSE, module, FALSE, FALSE,
+                                       FALSE, FALSE, FALSE, history_before, history_before, NULL);
+      json_builder_set_member_name(builder, "reason");
+      json_builder_add_string_value(builder, "unsupported-module-state");
+      json_builder_set_member_name(builder, "status");
+      json_builder_add_string_value(builder, "unavailable");
+      json_builder_end_object(builder);
+      return _live_json_builder_to_string(builder);
+    }
+
+    dt_iop_module_t *result_module =
+      _live_create_module_instance(module, action_kind == DT_LIVE_MODULE_INSTANCE_ACTION_DUPLICATE);
+
+    const gint history_after = dev->history_end;
+    g_autofree gchar *snapshot_json = _live_snapshot_to_json(dev);
+
+    _live_snapshot_add_module_action(builder, instance_key, action, FALSE, FALSE, result_module, FALSE,
+                                     FALSE, FALSE, FALSE, TRUE, history_before, history_after,
+                                     result_module);
+
+    if(result_module == NULL)
+    {
+      json_builder_set_member_name(builder, "reason");
+      json_builder_add_string_value(builder, "module-action-failed");
+      json_builder_set_member_name(builder, "status");
+      json_builder_add_string_value(builder, "unavailable");
+      json_builder_end_object(builder);
+      return _live_json_builder_to_string(builder);
+    }
+
+    JsonNode *snapshot_root = _live_json_copy_object_root(snapshot_json);
+    if(snapshot_root == NULL)
+    {
+      json_builder_set_member_name(builder, "reason");
+      json_builder_add_string_value(builder, "snapshot-unavailable");
+      json_builder_set_member_name(builder, "status");
+      json_builder_add_string_value(builder, "unavailable");
+      json_builder_end_object(builder);
+      return _live_json_builder_to_string(builder);
+    }
+
+    json_builder_set_member_name(builder, "snapshot");
+    json_builder_add_value(builder, snapshot_root);
+    json_builder_set_member_name(builder, "status");
+    json_builder_add_string_value(builder, "ok");
+    json_builder_end_object(builder);
+    return _live_json_builder_to_string(builder);
+  }
+
   if(module->hide_enable_button || module->off == NULL)
   {
     _live_snapshot_add_module_action(builder, instance_key, action, TRUE, requested_enabled, module, TRUE,
-                                     previous_enabled, TRUE, module->enabled, history_before, history_before);
+                                     previous_enabled, TRUE, module->enabled, TRUE, history_before,
+                                     history_before, NULL);
     json_builder_set_member_name(builder, "reason");
     json_builder_add_string_value(builder, "unsupported-module-state");
     json_builder_set_member_name(builder, "status");
@@ -645,7 +822,8 @@ static gchar *_live_apply_module_instance_action_to_json(dt_develop_t *dev,
   g_autofree gchar *snapshot_json = _live_snapshot_to_json(dev);
 
   _live_snapshot_add_module_action(builder, instance_key, action, TRUE, requested_enabled, module, TRUE,
-                                   previous_enabled, TRUE, current_enabled, history_before, history_after);
+                                   previous_enabled, TRUE, current_enabled, TRUE, history_before,
+                                   history_after, NULL);
 
   if(current_enabled != requested_enabled)
   {
