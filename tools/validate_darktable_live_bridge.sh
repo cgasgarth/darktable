@@ -284,8 +284,107 @@ print(json.loads(sys.argv[1])['previousEnabled'])
 PY
 )
 duplicate_result_toggle_json=$(run_bridge apply-module-instance-action "$duplicate_result_key" "$duplicate_result_action")
+module_reorder_target_json=$(python3 - "$module_instance_duplicate_json" "$module_instance_target_json" <<'PY'
+import json, sys
+duplicate_payload = json.loads(sys.argv[1])
+source_payload = json.loads(sys.argv[2])
+action = duplicate_payload.get('moduleAction') or {}
+source_key = source_payload.get('instanceKey')
+result_key = action.get('resultInstanceKey')
+if not isinstance(source_key, str) or not source_key:
+    raise SystemExit('missing source instance key for reorder test')
+if not isinstance(result_key, str) or not result_key:
+    raise SystemExit('missing duplicate instance key for reorder test')
+print(json.dumps({
+    'targetInstanceKey': result_key,
+    'anchorInstanceKey': source_key,
+}, separators=(',', ':')))
+PY
+)
+module_reorder_target_key=$(python3 - "$module_reorder_target_json" <<'PY'
+import json, sys
+print(json.loads(sys.argv[1])['targetInstanceKey'])
+PY
+)
+module_reorder_anchor_key=$(python3 - "$module_reorder_target_json" <<'PY'
+import json, sys
+print(json.loads(sys.argv[1])['anchorInstanceKey'])
+PY
+)
+module_reorder_move_before_json=$(run_bridge apply-module-instance-action "$module_reorder_target_key" move-before "$module_reorder_anchor_key")
+module_reorder_move_before_noop_json=$(run_bridge apply-module-instance-action "$module_reorder_target_key" move-before "$module_reorder_anchor_key")
+module_reorder_move_after_json=$(run_bridge apply-module-instance-action "$module_reorder_target_key" move-after "$module_reorder_anchor_key")
+unknown_anchor_module_reorder_json=$(run_bridge apply-module-instance-action "$module_reorder_target_key" move-before unknown#-1#-1#missing-anchor)
 unsupported_module_action_json=$(run_bridge apply-module-instance-action "$module_instance_key" unsupported-action)
 unknown_module_instance_json=$(run_bridge apply-module-instance-action unknown#-1#-1#missing enable)
+fence_blocked_module_reorder_json=$(python3 - "$snapshot_json" "$bridge_bin" <<'PY'
+import json, subprocess, sys
+
+snapshot = json.loads(sys.argv[1])
+bridge = sys.argv[2]
+module_stack = ((snapshot.get('snapshot') or {}).get('moduleStack') or [])
+
+fence_item = None
+anchor_item = None
+for item in module_stack:
+    if not isinstance(item, dict):
+        continue
+    if fence_item is None and item.get('moduleOp') == 'demosaic':
+        fence_item = item
+    if anchor_item is None and item.get('instanceKey') != (fence_item or {}).get('instanceKey'):
+        anchor_item = item
+
+if fence_item is not None and anchor_item is not None:
+    payload = subprocess.check_output(
+        [bridge, 'apply-module-instance-action', fence_item['instanceKey'], 'move-after', anchor_item['instanceKey']],
+        text=True,
+    )
+    print(payload.strip())
+else:
+    print(json.dumps({'status': 'skipped', 'reason': 'no-visible-fence-module'}))
+PY
+)
+rule_blocked_module_reorder_json=$(python3 - "$snapshot_json" "$bridge_bin" <<'PY'
+import json, subprocess, sys
+
+snapshot = json.loads(sys.argv[1])
+bridge = sys.argv[2]
+rules = [
+    ('rawprepare', 'invert'),
+    ('invert', 'temperature'),
+    ('temperature', 'highlights'),
+    ('highlights', 'cacorrect'),
+    ('cacorrect', 'hotpixels'),
+    ('hotpixels', 'rawdenoise'),
+    ('rawdenoise', 'demosaic'),
+    ('demosaic', 'colorin'),
+    ('colorin', 'colorout'),
+    ('flip', 'crop'),
+    ('flip', 'clipping'),
+    ('ashift', 'clipping'),
+    ('colorin', 'channelmixerrgb'),
+]
+module_stack = ((snapshot.get('snapshot') or {}).get('moduleStack') or [])
+by_op = {}
+for item in module_stack:
+    if isinstance(item, dict) and isinstance(item.get('moduleOp'), str):
+        by_op.setdefault(item['moduleOp'], []).append(item)
+
+for op_prev, op_next in rules:
+    prev_items = by_op.get(op_prev) or []
+    next_items = by_op.get(op_next) or []
+    if not prev_items or not next_items:
+        continue
+    payload = subprocess.check_output(
+        [bridge, 'apply-module-instance-action', next_items[0]['instanceKey'], 'move-before', prev_items[0]['instanceKey']],
+        text=True,
+    )
+    print(payload.strip())
+    break
+else:
+    print(json.dumps({'status': 'skipped', 'reason': 'no-visible-rule-pair'}))
+PY
+)
 
 switch_to_lighttable
 unsupported_view_snapshot_json=$(run_bridge get-snapshot)
@@ -307,7 +406,7 @@ if run_bridge set-exposure 4.5 >/dev/null 2>&1; then
   fail "set-exposure accepted out-of-range exposure"
 fi
 
-python3 - "$initial_json" "$snapshot_json" "$module_instance_target_json" "$list_json" "$get_control_json" "$set_json" "$post_set_exposure_json" "$set_control_json" "$post_set_control_json" "$unsupported_control_json" "$module_instance_action_json" "$module_instance_revert_json" "$module_instance_create_json" "$module_instance_duplicate_json" "$duplicate_result_target_json" "$duplicate_result_toggle_json" "$unsupported_module_action_json" "$unknown_module_instance_json" "$unsupported_view_snapshot_json" "$unsupported_view_get_control_json" "$unsupported_view_set_control_json" "$unsupported_view_module_instance_action_json" "$requested_exposure" "$requested_control_exposure" "$asset_path" <<'PY'
+python3 - "$initial_json" "$snapshot_json" "$module_instance_target_json" "$list_json" "$get_control_json" "$set_json" "$post_set_exposure_json" "$set_control_json" "$post_set_control_json" "$unsupported_control_json" "$module_instance_action_json" "$module_instance_revert_json" "$module_instance_create_json" "$module_instance_duplicate_json" "$duplicate_result_target_json" "$duplicate_result_toggle_json" "$module_reorder_target_json" "$module_reorder_move_before_json" "$module_reorder_move_before_noop_json" "$module_reorder_move_after_json" "$unknown_anchor_module_reorder_json" "$fence_blocked_module_reorder_json" "$rule_blocked_module_reorder_json" "$unsupported_module_action_json" "$unknown_module_instance_json" "$unsupported_view_snapshot_json" "$unsupported_view_get_control_json" "$unsupported_view_set_control_json" "$unsupported_view_module_instance_action_json" "$requested_exposure" "$requested_control_exposure" "$asset_path" <<'PY'
 import json, math, os, sys
 initial = json.loads(sys.argv[1])
 snapshot = json.loads(sys.argv[2])
@@ -325,15 +424,22 @@ module_instance_create = json.loads(sys.argv[13])
 module_instance_duplicate = json.loads(sys.argv[14])
 duplicate_result_target = json.loads(sys.argv[15])
 duplicate_result_toggle = json.loads(sys.argv[16])
-unsupported_module_action = json.loads(sys.argv[17])
-unknown_module_instance = json.loads(sys.argv[18])
-unsupported_view_snapshot = json.loads(sys.argv[19])
-unsupported_view_get = json.loads(sys.argv[20])
-unsupported_view_set = json.loads(sys.argv[21])
-unsupported_view_module_instance_action = json.loads(sys.argv[22])
-requested = float(sys.argv[23])
-requested_control = float(sys.argv[24])
-asset = os.path.realpath(sys.argv[25])
+module_reorder_target = json.loads(sys.argv[17])
+module_reorder_move_before = json.loads(sys.argv[18])
+module_reorder_move_before_noop = json.loads(sys.argv[19])
+module_reorder_move_after = json.loads(sys.argv[20])
+unknown_anchor_module_reorder = json.loads(sys.argv[21])
+fence_blocked_module_reorder = json.loads(sys.argv[22])
+rule_blocked_module_reorder = json.loads(sys.argv[23])
+unsupported_module_action = json.loads(sys.argv[24])
+unknown_module_instance = json.loads(sys.argv[25])
+unsupported_view_snapshot = json.loads(sys.argv[26])
+unsupported_view_get = json.loads(sys.argv[27])
+unsupported_view_set = json.loads(sys.argv[28])
+unsupported_view_module_instance_action = json.loads(sys.argv[29])
+requested = float(sys.argv[30])
+requested_control = float(sys.argv[31])
+asset = os.path.realpath(sys.argv[32])
 
 EXPECTED_CONTROL_ID = 'exposure.exposure'
 
@@ -482,6 +588,59 @@ def expect_module_instance_create_like_response(name, payload, target_key, actio
         if isinstance(source_exposure, (int, float)) and isinstance(result_exposure, (int, float)) and abs(source_exposure - result_exposure) <= 1e-6:
             raise SystemExit(f'{name} create exposure unexpectedly matches source params: {payload}')
 
+def expect_module_reorder_response(name, payload, target_key, anchor_key, action):
+    expect_ok(name, payload)
+    action_payload = payload.get('moduleAction') or {}
+    if action_payload.get('targetInstanceKey') != target_key:
+        raise SystemExit(f'{name} target instance mismatch: {payload}')
+    if action_payload.get('anchorInstanceKey') != anchor_key:
+        raise SystemExit(f'{name} anchor instance mismatch: {payload}')
+    if action_payload.get('action') != action:
+        raise SystemExit(f'{name} action mismatch: {payload}')
+    for key in ('moduleOp', 'multiPriority', 'multiName'):
+        if key not in action_payload:
+            raise SystemExit(f'{name} missing {key}: {payload}')
+    for key in ('iopOrder', 'previousIopOrder', 'currentIopOrder', 'historyBefore', 'historyAfter', 'requestedHistoryEnd'):
+        if not isinstance(action_payload.get(key), int):
+            raise SystemExit(f'{name} missing integer {key}: {payload}')
+    if action_payload.get('iopOrder') != action_payload.get('currentIopOrder'):
+        raise SystemExit(f'{name} current iopOrder mismatch: {payload}')
+    if action_payload.get('requestedHistoryEnd') != action_payload.get('historyAfter'):
+        raise SystemExit(f'{name} requested history end mismatch: {payload}')
+    if action_payload.get('historyAfter') <= action_payload.get('historyBefore'):
+        raise SystemExit(f'{name} history did not advance: {payload}')
+    if action_payload.get('previousIopOrder') == action_payload.get('currentIopOrder'):
+        raise SystemExit(f'{name} iopOrder did not change: {payload}')
+
+    snapshot_payload = payload.get('snapshot') or {}
+    module_stack = snapshot_payload.get('moduleStack') or []
+    matching_items = [item for item in module_stack if isinstance(item, dict) and item.get('instanceKey') == target_key]
+    if len(matching_items) != 1:
+        raise SystemExit(f'{name} target snapshot item mismatch: {payload}')
+    if matching_items[0].get('iopOrder') != action_payload.get('currentIopOrder'):
+        raise SystemExit(f'{name} snapshot current iopOrder mismatch: {payload}')
+    positions = {}
+    for index, item in enumerate(module_stack):
+        if isinstance(item, dict) and isinstance(item.get('instanceKey'), str):
+            positions[item['instanceKey']] = index
+    if target_key not in positions or anchor_key not in positions:
+        raise SystemExit(f'{name} snapshot positions missing: {payload}')
+    if action == 'move-before' and not (positions[target_key] < positions[anchor_key]):
+        raise SystemExit(f'{name} target not before anchor in snapshot: {payload}')
+    if action == 'move-after' and not (positions[target_key] > positions[anchor_key]):
+        raise SystemExit(f'{name} target not after anchor in snapshot: {payload}')
+
+def expect_reorder_unavailable(name, payload, target_key, anchor_key, action, reason):
+    if payload.get('status') != 'unavailable' or payload.get('reason') != reason:
+        raise SystemExit(f'{name} response mismatch: {payload}')
+    action_payload = payload.get('moduleAction') or {}
+    if action_payload.get('targetInstanceKey') != target_key:
+        raise SystemExit(f'{name} target instance mismatch: {payload}')
+    if action_payload.get('anchorInstanceKey') != anchor_key:
+        raise SystemExit(f'{name} anchor instance mismatch: {payload}')
+    if action_payload.get('action') != action:
+        raise SystemExit(f'{name} action mismatch: {payload}')
+
 expect_ok('initial', initial)
 expect_ok('get-snapshot', snapshot)
 if listed.get('status') != 'ok':
@@ -572,6 +731,18 @@ duplicate_result_previous = duplicate_result_target.get('previousEnabled')
 duplicate_result_action = duplicate_result_target.get('action')
 duplicate_result_current = (duplicate_result_action == 'enable')
 expect_module_instance_response('apply-module-instance-action duplicate-result-toggle', duplicate_result_toggle, duplicate_result_key, duplicate_result_action, duplicate_result_previous, duplicate_result_current)
+module_reorder_target_key = module_reorder_target.get('targetInstanceKey')
+module_reorder_anchor_key = module_reorder_target.get('anchorInstanceKey')
+expect_module_reorder_response('apply-module-instance-action move-before', module_reorder_move_before, module_reorder_target_key, module_reorder_anchor_key, 'move-before')
+expect_reorder_unavailable('apply-module-instance-action move-before no-op', module_reorder_move_before_noop, module_reorder_target_key, module_reorder_anchor_key, 'move-before', 'module-reorder-no-op')
+expect_module_reorder_response('apply-module-instance-action move-after', module_reorder_move_after, module_reorder_target_key, module_reorder_anchor_key, 'move-after')
+expect_reorder_unavailable('apply-module-instance-action unknown-anchor', unknown_anchor_module_reorder, module_reorder_target_key, 'unknown#-1#-1#missing-anchor', 'move-before', 'unknown-anchor-instance-key')
+if fence_blocked_module_reorder.get('status') != 'skipped':
+    if fence_blocked_module_reorder.get('status') != 'unavailable' or fence_blocked_module_reorder.get('reason') != 'module-reorder-blocked-by-fence':
+        raise SystemExit(f'apply-module-instance-action fence-blocked response mismatch: {fence_blocked_module_reorder}')
+if rule_blocked_module_reorder.get('status') != 'skipped':
+    if rule_blocked_module_reorder.get('status') != 'unavailable' or rule_blocked_module_reorder.get('reason') != 'module-reorder-blocked-by-rule':
+        raise SystemExit(f'apply-module-instance-action rule-blocked response mismatch: {rule_blocked_module_reorder}')
 if unsupported_module_action.get('status') != 'unavailable' or unsupported_module_action.get('reason') != 'unsupported-module-action':
     raise SystemExit(f'unsupported module action response mismatch: {unsupported_module_action}')
 if (unsupported_module_action.get('moduleAction') or {}).get('targetInstanceKey') != module_target_key:
@@ -597,6 +768,12 @@ print('apply-module-instance-action-revert:', json.dumps(module_instance_revert,
 print('apply-module-instance-action-create:', json.dumps(module_instance_create, separators=(",", ":")))
 print('apply-module-instance-action-duplicate:', json.dumps(module_instance_duplicate, separators=(",", ":")))
 print('apply-module-instance-action-duplicate-result-toggle:', json.dumps(duplicate_result_toggle, separators=(",", ":")))
+print('apply-module-instance-action-move-before:', json.dumps(module_reorder_move_before, separators=(",", ":")))
+print('apply-module-instance-action-move-before-noop:', json.dumps(module_reorder_move_before_noop, separators=(",", ":")))
+print('apply-module-instance-action-move-after:', json.dumps(module_reorder_move_after, separators=(",", ":")))
+print('unknown-anchor-module-reorder:', json.dumps(unknown_anchor_module_reorder, separators=(",", ":")))
+print('fence-blocked-module-reorder:', json.dumps(fence_blocked_module_reorder, separators=(",", ":")))
+print('rule-blocked-module-reorder:', json.dumps(rule_blocked_module_reorder, separators=(",", ":")))
 print('unsupported-module-action:', json.dumps(unsupported_module_action, separators=(",", ":")))
 print('unknown-module-instance:', json.dumps(unknown_module_instance, separators=(",", ":")))
 print('unsupported-control:', json.dumps(unsupported, separators=(",", ":")))
