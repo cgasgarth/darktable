@@ -68,6 +68,7 @@
 
 #include <gdk/gdkkeysyms.h>
 #include <glib.h>
+#include <json-glib/json-glib.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -95,6 +96,325 @@ const char *name(const dt_view_t *self)
 
 #ifdef USE_LUA
 
+static const char *_live_snapshot_field_name(dt_introspection_field_t *field)
+{
+  if(field == NULL) return "value";
+  if(field->header.field_name && field->header.field_name[0] != '\0') return field->header.field_name;
+  if(field->header.name && field->header.name[0] != '\0') return field->header.name;
+  return "value";
+}
+
+static gchar *_live_snapshot_join_path(const gchar *prefix, const gchar *suffix)
+{
+  if(suffix == NULL || suffix[0] == '\0') return g_strdup(prefix ? prefix : "");
+  if(prefix == NULL || prefix[0] == '\0') return g_strdup(suffix);
+  return g_strdup_printf("%s.%s", prefix, suffix);
+}
+
+static gchar *_live_snapshot_index_path(const gchar *prefix, const size_t index)
+{
+  if(prefix == NULL || prefix[0] == '\0') return g_strdup_printf("[%zu]", index);
+  return g_strdup_printf("%s[%zu]", prefix, index);
+}
+
+static void _live_snapshot_add_field_header(JsonBuilder *builder, const gchar *path, const gchar *kind)
+{
+  json_builder_begin_object(builder);
+  json_builder_set_member_name(builder, "path");
+  json_builder_add_string_value(builder, path);
+  json_builder_set_member_name(builder, "kind");
+  json_builder_add_string_value(builder, kind);
+}
+
+static void _live_snapshot_add_integer_value(JsonBuilder *builder, const guint64 value)
+{
+  if(value <= G_MAXINT64)
+    json_builder_add_int_value(builder, (gint64)value);
+  else
+    json_builder_add_double_value(builder, (gdouble)value);
+}
+
+static void _live_snapshot_append_param_fields(JsonBuilder *builder,
+                                               dt_introspection_field_t *field,
+                                               const void *base,
+                                               const gchar *path)
+{
+  if(field == NULL || base == NULL) return;
+
+  const guint8 *value = ((const guint8 *)base) + field->header.offset;
+
+  switch(field->header.type)
+  {
+    case DT_INTROSPECTION_TYPE_STRUCT:
+    case DT_INTROSPECTION_TYPE_UNION:
+      for(size_t index = 0; index < field->Struct.entries; index++)
+      {
+        dt_introspection_field_t *child = field->Struct.fields[index];
+        g_autofree gchar *child_path = _live_snapshot_join_path(path, _live_snapshot_field_name(child));
+        _live_snapshot_append_param_fields(builder, child, base, child_path);
+      }
+      break;
+    case DT_INTROSPECTION_TYPE_ARRAY:
+      if(field->Array.type == DT_INTROSPECTION_TYPE_CHAR)
+      {
+        const char *text = (const char *)value;
+        const size_t text_len = strnlen(text, field->Array.count);
+        if(g_utf8_validate(text, text_len, NULL))
+        {
+          g_autofree gchar *string_value = g_strndup(text, text_len);
+          _live_snapshot_add_field_header(builder, path, "string");
+          json_builder_set_member_name(builder, "value");
+          json_builder_add_string_value(builder, string_value);
+          json_builder_end_object(builder);
+          break;
+        }
+      }
+
+      for(size_t index = 0; index < field->Array.count; index++)
+      {
+        dt_introspection_field_t *child = NULL;
+        const void *child_value = dt_introspection_access_array(field, (void *)value, index, &child);
+        if(child_value == NULL || child == NULL) continue;
+
+        g_autofree gchar *child_path = _live_snapshot_index_path(path, index);
+        _live_snapshot_append_param_fields(builder, child,
+                                           (const guint8 *)child_value - child->header.offset,
+                                           child_path);
+      }
+      break;
+    case DT_INTROSPECTION_TYPE_FLOAT:
+      if(isfinite(*(const float *)value))
+      {
+        _live_snapshot_add_field_header(builder, path, "float");
+        json_builder_set_member_name(builder, "value");
+        json_builder_add_double_value(builder, *(const float *)value);
+        json_builder_end_object(builder);
+      }
+      break;
+    case DT_INTROSPECTION_TYPE_DOUBLE:
+      if(isfinite(*(const double *)value))
+      {
+        _live_snapshot_add_field_header(builder, path, "double");
+        json_builder_set_member_name(builder, "value");
+        json_builder_add_double_value(builder, *(const double *)value);
+        json_builder_end_object(builder);
+      }
+      break;
+    case DT_INTROSPECTION_TYPE_CHAR:
+      _live_snapshot_add_field_header(builder, path, "char");
+      json_builder_set_member_name(builder, "value");
+      json_builder_add_int_value(builder, (gint64)*(const char *)value);
+      json_builder_end_object(builder);
+      break;
+    case DT_INTROSPECTION_TYPE_INT8:
+      _live_snapshot_add_field_header(builder, path, "int8");
+      json_builder_set_member_name(builder, "value");
+      json_builder_add_int_value(builder, (gint64)*(const int8_t *)value);
+      json_builder_end_object(builder);
+      break;
+    case DT_INTROSPECTION_TYPE_UINT8:
+      _live_snapshot_add_field_header(builder, path, "uint8");
+      json_builder_set_member_name(builder, "value");
+      json_builder_add_int_value(builder, (gint64)*(const uint8_t *)value);
+      json_builder_end_object(builder);
+      break;
+    case DT_INTROSPECTION_TYPE_SHORT:
+      _live_snapshot_add_field_header(builder, path, "short");
+      json_builder_set_member_name(builder, "value");
+      json_builder_add_int_value(builder, (gint64)*(const short *)value);
+      json_builder_end_object(builder);
+      break;
+    case DT_INTROSPECTION_TYPE_USHORT:
+      _live_snapshot_add_field_header(builder, path, "ushort");
+      json_builder_set_member_name(builder, "value");
+      json_builder_add_int_value(builder, (gint64)*(const unsigned short *)value);
+      json_builder_end_object(builder);
+      break;
+    case DT_INTROSPECTION_TYPE_INT:
+      _live_snapshot_add_field_header(builder, path, "int");
+      json_builder_set_member_name(builder, "value");
+      json_builder_add_int_value(builder, (gint64)*(const int *)value);
+      json_builder_end_object(builder);
+      break;
+    case DT_INTROSPECTION_TYPE_UINT:
+      _live_snapshot_add_field_header(builder, path, "uint");
+      json_builder_set_member_name(builder, "value");
+      json_builder_add_int_value(builder, (gint64)*(const unsigned int *)value);
+      json_builder_end_object(builder);
+      break;
+    case DT_INTROSPECTION_TYPE_LONG:
+      _live_snapshot_add_field_header(builder, path, "long");
+      json_builder_set_member_name(builder, "value");
+      json_builder_add_int_value(builder, (gint64)*(const long *)value);
+      json_builder_end_object(builder);
+      break;
+    case DT_INTROSPECTION_TYPE_ULONG:
+      _live_snapshot_add_field_header(builder, path, "ulong");
+      json_builder_set_member_name(builder, "value");
+      _live_snapshot_add_integer_value(builder, *(const unsigned long *)value);
+      json_builder_end_object(builder);
+      break;
+    case DT_INTROSPECTION_TYPE_BOOL:
+      _live_snapshot_add_field_header(builder, path, "bool");
+      json_builder_set_member_name(builder, "value");
+      json_builder_add_boolean_value(builder, *(const gboolean *)value);
+      json_builder_end_object(builder);
+      break;
+    case DT_INTROSPECTION_TYPE_ENUM:
+      {
+        _live_snapshot_add_field_header(builder, path, "enum");
+        json_builder_set_member_name(builder, "value");
+        const int enum_value = *(const int *)value;
+        const char *enum_name = dt_introspection_get_enum_name(field, enum_value);
+        if(enum_name != NULL)
+          json_builder_add_string_value(builder, enum_name);
+        else
+          json_builder_add_int_value(builder, (gint64)enum_value);
+        json_builder_end_object(builder);
+      }
+      break;
+    case DT_INTROSPECTION_TYPE_NONE:
+    case DT_INTROSPECTION_TYPE_OPAQUE:
+    case DT_INTROSPECTION_TYPE_FLOATCOMPLEX:
+    default:
+      break;
+  }
+}
+
+static void _live_snapshot_add_params(JsonBuilder *builder,
+                                      dt_iop_module_t *module,
+                                      const void *params)
+{
+  json_builder_set_member_name(builder, "params");
+  json_builder_begin_object(builder);
+
+  if(module != NULL && module->have_introspection && params != NULL)
+  {
+    dt_introspection_t *introspection = module->get_introspection();
+    if(introspection != NULL && introspection->field != NULL)
+    {
+      json_builder_set_member_name(builder, "encoding");
+      json_builder_add_string_value(builder, "introspection-v1");
+      json_builder_set_member_name(builder, "fields");
+      json_builder_begin_array(builder);
+      _live_snapshot_append_param_fields(builder, introspection->field, params, "");
+      json_builder_end_array(builder);
+      json_builder_end_object(builder);
+      return;
+    }
+  }
+
+  json_builder_set_member_name(builder, "encoding");
+  json_builder_add_string_value(builder, "unsupported");
+  json_builder_end_object(builder);
+}
+
+static gchar *_live_snapshot_instance_key(const char *module_op,
+                                          const gint instance,
+                                          const gint multi_priority,
+                                          const char *multi_name)
+{
+  return g_strdup_printf("%s#%d#%d#%s",
+                         module_op ? module_op : "unknown",
+                         instance,
+                         multi_priority,
+                         multi_name ? multi_name : "");
+}
+
+static void _live_snapshot_add_stack_item(JsonBuilder *builder, dt_iop_module_t *module)
+{
+  g_autofree gchar *instance_key =
+    _live_snapshot_instance_key(module->op, module->instance, module->multi_priority, module->multi_name);
+
+  json_builder_begin_object(builder);
+  json_builder_set_member_name(builder, "instanceKey");
+  json_builder_add_string_value(builder, instance_key);
+  json_builder_set_member_name(builder, "moduleOp");
+  json_builder_add_string_value(builder, module->op);
+  json_builder_set_member_name(builder, "enabled");
+  json_builder_add_boolean_value(builder, module->enabled);
+  json_builder_set_member_name(builder, "iopOrder");
+  json_builder_add_int_value(builder, module->iop_order);
+  json_builder_set_member_name(builder, "multiPriority");
+  json_builder_add_int_value(builder, module->multi_priority);
+  json_builder_set_member_name(builder, "multiName");
+  json_builder_add_string_value(builder, module->multi_name);
+  _live_snapshot_add_params(builder, module, module->params);
+  json_builder_end_object(builder);
+}
+
+static void _live_snapshot_add_history_item(JsonBuilder *builder,
+                                            const dt_dev_history_item_t *history_item,
+                                            const gint index,
+                                            const gint history_end)
+{
+  const dt_iop_module_t *module = history_item->module;
+  const char *module_op = module ? module->op : history_item->op_name;
+  const gint instance = module ? module->instance : -1;
+  g_autofree gchar *instance_key =
+    _live_snapshot_instance_key(module_op, instance, history_item->multi_priority, history_item->multi_name);
+
+  json_builder_begin_object(builder);
+  json_builder_set_member_name(builder, "index");
+  json_builder_add_int_value(builder, index);
+  json_builder_set_member_name(builder, "applied");
+  json_builder_add_boolean_value(builder, index < history_end);
+  json_builder_set_member_name(builder, "instanceKey");
+  json_builder_add_string_value(builder, instance_key);
+  json_builder_set_member_name(builder, "moduleOp");
+  json_builder_add_string_value(builder, module_op ? module_op : "unknown");
+  json_builder_set_member_name(builder, "enabled");
+  json_builder_add_boolean_value(builder, history_item->enabled);
+  json_builder_set_member_name(builder, "iopOrder");
+  json_builder_add_int_value(builder, history_item->iop_order);
+  json_builder_set_member_name(builder, "multiPriority");
+  json_builder_add_int_value(builder, history_item->multi_priority);
+  json_builder_set_member_name(builder, "multiName");
+  json_builder_add_string_value(builder, history_item->multi_name);
+  _live_snapshot_add_params(builder, history_item->module, history_item->params);
+  json_builder_end_object(builder);
+}
+
+static gchar *_live_snapshot_to_json(dt_develop_t *dev)
+{
+  g_autoptr(JsonBuilder) builder = json_builder_new();
+  json_builder_begin_object(builder);
+  json_builder_set_member_name(builder, "appliedHistoryEnd");
+  json_builder_add_int_value(builder, dev->history_end);
+
+  json_builder_set_member_name(builder, "moduleStack");
+  json_builder_begin_array(builder);
+  for(const GList *iter = dev->iop; iter; iter = g_list_next(iter))
+  {
+    dt_iop_module_t *module = iter->data;
+    if(module == NULL || dt_iop_is_hidden(module)) continue;
+    _live_snapshot_add_stack_item(builder, module);
+  }
+  json_builder_end_array(builder);
+
+  json_builder_set_member_name(builder, "historyItems");
+  json_builder_begin_array(builder);
+  dt_pthread_mutex_lock(&dev->history_mutex);
+  int index = 0;
+  for(const GList *iter = dev->history; iter; iter = g_list_next(iter), index++)
+  {
+    dt_dev_history_item_t *history_item = iter->data;
+    if(history_item == NULL) continue;
+    _live_snapshot_add_history_item(builder, history_item, index, dev->history_end);
+  }
+  dt_pthread_mutex_unlock(&dev->history_mutex);
+  json_builder_end_array(builder);
+  json_builder_end_object(builder);
+
+  JsonNode *root = json_builder_get_root(builder);
+  g_autoptr(JsonGenerator) generator = json_generator_new();
+  json_generator_set_root(generator, root);
+  json_generator_set_pretty(generator, FALSE);
+  g_autofree gchar *json = json_generator_to_data(generator, NULL);
+  json_node_free(root);
+  return g_strdup(json);
+}
+
 static int display_image_cb(lua_State *L)
 {
   dt_develop_t *dev = darktable.develop;
@@ -110,6 +430,14 @@ static int display_image_cb(lua_State *L)
     dt_dev_write_history(dev);
   }
   luaA_push(L, dt_lua_image_t, &dev->image_storage.id);
+  return 1;
+}
+
+static int live_snapshot_cb(lua_State *L)
+{
+  dt_develop_t *dev = darktable.develop;
+  g_autofree gchar *snapshot_json = _live_snapshot_to_json(dev);
+  lua_pushstring(L, snapshot_json ? snapshot_json : "{}");
   return 1;
 }
 
@@ -165,6 +493,11 @@ void init(dt_view_t *self)
   dt_lua_gtk_wrap(L);
   lua_pushcclosure(L, dt_lua_type_member_common, 1);
   dt_lua_type_register_const_type(L, my_type, "display_image");
+  lua_pushlightuserdata(L, self);
+  lua_pushcclosure(L, live_snapshot_cb, 1);
+  dt_lua_gtk_wrap(L);
+  lua_pushcclosure(L, dt_lua_type_member_common, 1);
+  dt_lua_type_register_const_type(L, my_type, "live_snapshot");
 #endif
 }
 

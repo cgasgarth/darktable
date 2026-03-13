@@ -19,7 +19,7 @@ shift
 source_asset_path=${DARKTABLE_LIVE_BRIDGE_ASSET:-/home/cgasgarth/Documents/projects/aiPhotoEditing/darktableAI/assets/_DSC8809.ARW}
 requested_exposure=${DARKTABLE_LIVE_BRIDGE_EXPOSURE:-1.25}
 requested_control_exposure=${DARKTABLE_LIVE_BRIDGE_CONTROL_EXPOSURE:-0.5}
-darktable_bin=${DARKTABLE_LIVE_BRIDGE_DARKTABLE:-/usr/bin/darktable}
+darktable_bin=${DARKTABLE_LIVE_BRIDGE_DARKTABLE:-$repo_root/build/bin/darktable}
 bridge_bin=${DARKTABLE_LIVE_BRIDGE_HELPER:-$repo_root/build/bin/darktable-live-bridge}
 tmux_session=${DARKTABLE_LIVE_BRIDGE_TMUX_SESSION:-darktable-live-validate-$$}
 tmux_socket=${DARKTABLE_LIVE_BRIDGE_TMUX_SOCKET:-darktable-live-validate-$$}
@@ -49,6 +49,7 @@ library_path="$run_root/library.db"
 darktable_log="$run_root/darktable.log"
 mkdir -p "$config_dir" "$cache_dir" "$tmp_dir" "$runtime_dir" "$asset_dir"
 chmod 700 "$runtime_dir"
+printf 'ui/show_welcome_screen=false\n' >"$config_dir/darktablerc"
 
 asset_path="$asset_dir/$(basename "$source_asset_path")"
 cp -- "$source_asset_path" "$asset_path"
@@ -186,6 +187,7 @@ start_darktable_host
 wait_for_remote_lua
 
 initial_json=$(wait_for_session_payload "$ready_attempts")
+snapshot_json=$(run_bridge get-snapshot)
 list_json=$(run_bridge list-controls)
 get_control_json=$(run_bridge get-control exposure.exposure)
 set_json=$(run_bridge set-exposure "$requested_exposure")
@@ -195,6 +197,7 @@ post_set_control_json=$(wait_for_session_payload "$post_set_attempts" "$requeste
 unsupported_control_json=$(run_bridge get-control unsupported.control)
 
 switch_to_lighttable
+unsupported_view_snapshot_json=$(run_bridge get-snapshot)
 unsupported_view_get_control_json=$(run_bridge get-control exposure.exposure)
 unsupported_view_set_control_json=$(run_bridge set-control exposure.exposure "$requested_control_exposure")
 switch_to_darkroom
@@ -212,21 +215,23 @@ if run_bridge set-exposure 4.5 >/dev/null 2>&1; then
   fail "set-exposure accepted out-of-range exposure"
 fi
 
-python3 - "$initial_json" "$list_json" "$get_control_json" "$set_json" "$post_set_exposure_json" "$set_control_json" "$post_set_control_json" "$unsupported_control_json" "$unsupported_view_get_control_json" "$unsupported_view_set_control_json" "$requested_exposure" "$requested_control_exposure" "$asset_path" <<'PY'
+python3 - "$initial_json" "$snapshot_json" "$list_json" "$get_control_json" "$set_json" "$post_set_exposure_json" "$set_control_json" "$post_set_control_json" "$unsupported_control_json" "$unsupported_view_snapshot_json" "$unsupported_view_get_control_json" "$unsupported_view_set_control_json" "$requested_exposure" "$requested_control_exposure" "$asset_path" <<'PY'
 import json, math, os, sys
 initial = json.loads(sys.argv[1])
-listed = json.loads(sys.argv[2])
-get_control = json.loads(sys.argv[3])
-set_payload = json.loads(sys.argv[4])
-post_set_exposure = json.loads(sys.argv[5])
-set_control = json.loads(sys.argv[6])
-post_set_control = json.loads(sys.argv[7])
-unsupported = json.loads(sys.argv[8])
-unsupported_view_get = json.loads(sys.argv[9])
-unsupported_view_set = json.loads(sys.argv[10])
-requested = float(sys.argv[11])
-requested_control = float(sys.argv[12])
-asset = os.path.realpath(sys.argv[13])
+snapshot = json.loads(sys.argv[2])
+listed = json.loads(sys.argv[3])
+get_control = json.loads(sys.argv[4])
+set_payload = json.loads(sys.argv[5])
+post_set_exposure = json.loads(sys.argv[6])
+set_control = json.loads(sys.argv[7])
+post_set_control = json.loads(sys.argv[8])
+unsupported = json.loads(sys.argv[9])
+unsupported_view_snapshot = json.loads(sys.argv[10])
+unsupported_view_get = json.loads(sys.argv[11])
+unsupported_view_set = json.loads(sys.argv[12])
+requested = float(sys.argv[13])
+requested_control = float(sys.argv[14])
+asset = os.path.realpath(sys.argv[15])
 
 EXPECTED_CONTROL_ID = 'exposure.exposure'
 
@@ -255,9 +260,62 @@ def expect_control_metadata(name, control):
     if requires.get('view') != 'darkroom' or requires.get('activeImage') is not True:
         raise SystemExit(f'{name} requires mismatch: {control}')
 
+def expect_params_shape(name, params):
+    if not isinstance(params, dict):
+        raise SystemExit(f'{name} params missing: {params}')
+    encoding = params.get('encoding')
+    if encoding == 'introspection-v1':
+        fields = params.get('fields')
+        if not isinstance(fields, list):
+            raise SystemExit(f'{name} introspection fields missing: {params}')
+        for field in fields[:5]:
+            if not isinstance(field, dict):
+                raise SystemExit(f'{name} field entry malformed: {field}')
+            if not isinstance(field.get('path'), str) or not isinstance(field.get('kind'), str) or 'value' not in field:
+                raise SystemExit(f'{name} field shape mismatch: {field}')
+    elif encoding != 'unsupported':
+        raise SystemExit(f'{name} params encoding mismatch: {params}')
+
+def expect_snapshot_item(name, item, expect_index):
+    required = ['instanceKey', 'moduleOp', 'enabled', 'iopOrder', 'multiPriority', 'multiName', 'params']
+    if expect_index:
+        required = ['index', 'applied'] + required
+    for key in required:
+        if key not in item:
+            raise SystemExit(f'{name} missing {key}: {item}')
+    expect_params_shape(f'{name} params', item.get('params'))
+
 expect_ok('initial', initial)
+expect_ok('get-snapshot', snapshot)
 if listed.get('status') != 'ok':
     raise SystemExit(f'list-controls status not ok: {listed}')
+snapshot_payload = snapshot.get('snapshot') or {}
+applied_history_end = snapshot_payload.get('appliedHistoryEnd')
+if not isinstance(applied_history_end, int) or applied_history_end < 0:
+    raise SystemExit(f'get-snapshot appliedHistoryEnd mismatch: {snapshot}')
+snapshot_controls = snapshot_payload.get('controls')
+if not isinstance(snapshot_controls, list) or len(snapshot_controls) < 1:
+    raise SystemExit(f'get-snapshot controls mismatch: {snapshot}')
+exposure_snapshot_controls = [control for control in snapshot_controls if isinstance(control, dict) and control.get('id') == EXPECTED_CONTROL_ID]
+if len(exposure_snapshot_controls) != 1:
+    raise SystemExit(f'get-snapshot exposure control missing: {snapshot}')
+expect_control_metadata('get-snapshot control', exposure_snapshot_controls[0])
+expect_close('get-snapshot control value', exposure_snapshot_controls[0].get('value'), (initial.get('exposure') or {}).get('current'))
+module_stack = snapshot_payload.get('moduleStack')
+history_items = snapshot_payload.get('historyItems')
+if not isinstance(module_stack, list) or len(module_stack) < 1:
+    raise SystemExit(f'get-snapshot moduleStack mismatch: {snapshot}')
+if not isinstance(history_items, list) or len(history_items) < applied_history_end:
+    raise SystemExit(f'get-snapshot historyItems mismatch: {snapshot}')
+expect_snapshot_item('get-snapshot moduleStack[0]', module_stack[0], False)
+if history_items:
+    expect_snapshot_item('get-snapshot historyItems[0]', history_items[0], True)
+elif applied_history_end != 0:
+    raise SystemExit(f'get-snapshot historyItems unexpectedly empty: {snapshot}')
+if not any(item.get('moduleOp') == 'exposure' for item in module_stack if isinstance(item, dict)):
+    raise SystemExit(f'get-snapshot moduleStack missing exposure module: {snapshot}')
+if applied_history_end > 0 and not any(isinstance(item, dict) and item.get('applied') is True for item in history_items[:applied_history_end]):
+    raise SystemExit(f'get-snapshot applied history mismatch: {snapshot}')
 controls = listed.get('controls')
 if not isinstance(controls, list) or len(controls) != 1:
     raise SystemExit(f'list-controls unexpected controls: {listed}')
@@ -289,6 +347,10 @@ if unsupported.get('requestedControlId') != 'unsupported.control':
     raise SystemExit(f'unsupported control id mismatch: {unsupported}')
 if unsupported.get('session', {}).get('view') != 'darkroom':
     raise SystemExit(f'unsupported control session mismatch: {unsupported}')
+if unsupported_view_snapshot.get('status') != 'unavailable' or unsupported_view_snapshot.get('reason') != 'unsupported-view':
+    raise SystemExit(f'unsupported-view get-snapshot response mismatch: {unsupported_view_snapshot}')
+if unsupported_view_snapshot.get('session', {}).get('view') != 'lighttable':
+    raise SystemExit(f'unsupported-view get-snapshot session mismatch: {unsupported_view_snapshot}')
 for name, payload in (
     ('unsupported-view get-control', unsupported_view_get),
     ('unsupported-view set-control', unsupported_view_set),
@@ -300,6 +362,7 @@ for name, payload in (
     if payload.get('session', {}).get('view') != 'lighttable':
         raise SystemExit(f'{name} session mismatch: {payload}')
 print('initial:', json.dumps(initial, separators=(",", ":")))
+print('get-snapshot:', json.dumps(snapshot, separators=(",", ":")))
 print('list-controls:', json.dumps(listed, separators=(",", ":")))
 print('get-control:', json.dumps(get_control, separators=(",", ":")))
 print('set-exposure:', json.dumps(set_payload, separators=(",", ":")))
@@ -307,6 +370,7 @@ print('post-set-exposure:', json.dumps(post_set_exposure, separators=(",", ":"))
 print('set-control:', json.dumps(set_control, separators=(",", ":")))
 print('post-set-control:', json.dumps(post_set_control, separators=(",", ":")))
 print('unsupported-control:', json.dumps(unsupported, separators=(",", ":")))
+print('unsupported-view-get-snapshot:', json.dumps(unsupported_view_snapshot, separators=(",", ":")))
 print('unsupported-view-get-control:', json.dumps(unsupported_view_get, separators=(",", ":")))
 print('unsupported-view-set-control:', json.dumps(unsupported_view_set, separators=(",", ":")))
 print('result: post-set get-session reports both requested exposure targets')

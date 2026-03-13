@@ -38,12 +38,13 @@ static void usage(FILE *stream, const char *progname)
   fprintf(stream,
           "Usage:\n"
           "  %s get-session\n"
+          "  %s get-snapshot\n"
           "  %s list-controls\n"
           "  %s get-control <control-id>\n"
           "  %s set-control <control-id> <value-json>\n"
           "  %s set-exposure <EV>\n"
           "  %s --help\n",
-          progname, progname, progname, progname, progname, progname);
+          progname, progname, progname, progname, progname, progname, progname);
 }
 
 static gboolean print_json_only(const gchar *json, GError **error)
@@ -383,6 +384,40 @@ static gchar *build_lua_command(const gchar *command, const gchar *control_id,
     "    return available_payload(image)\n"
     "  end\n"
     "\n"
+    "  local control_registry\n"
+    "\n"
+    "  local function splice_snapshot_controls(snapshot_json, controls)\n"
+    "    if type(snapshot_json) ~= 'string' or snapshot_json == '' then error('snapshot unavailable') end\n"
+    "    if string.sub(snapshot_json, -1) ~= '}' then error('snapshot payload malformed') end\n"
+    "    return string.sub(snapshot_json, 1, -2) .. ',\"controls\":' .. json_encode(controls) .. '}'\n"
+    "  end\n"
+    "\n"
+    "  local function snapshot_controls()\n"
+    "    local controls = {}\n"
+    "    for _, control_id in ipairs({ 'exposure.exposure' }) do\n"
+    "      local adapter = control_registry()[control_id]\n"
+    "      controls[#controls + 1] = adapter.snapshot and adapter.snapshot() or adapter.list()\n"
+    "    end\n"
+    "    return controls\n"
+    "  end\n"
+    "\n"
+    "  local function get_snapshot_json()\n"
+    "    local image, reason = current_image()\n"
+    "    if not image then return json_encode(unavailable(reason)) end\n"
+    "\n"
+    "    local darkroom = darktable.gui.views.darkroom\n"
+    "    local snapshot_json = darkroom and darkroom.live_snapshot and darkroom.live_snapshot() or nil\n"
+    "    snapshot_json = splice_snapshot_controls(snapshot_json, snapshot_controls())\n"
+    "\n"
+    "    return '{'\n"
+    "      .. '\"bridgeVersion\":' .. json_encode(bridge.bridgeVersion)\n"
+    "      .. ',\"status\":\"ok\"'\n"
+    "      .. ',\"session\":' .. json_encode(session_object())\n"
+    "      .. ',\"activeImage\":' .. json_encode(active_image_object(image))\n"
+    "      .. ',\"snapshot\":' .. snapshot_json\n"
+    "      .. '}'\n"
+    "  end\n"
+    "\n"
     "  local function exposure_action()\n"
     "    if bridge.exposureAction then return bridge.exposureAction end\n"
     "    local candidates = { 'iop/exposure/exposure', 'exposure/exposure' }\n"
@@ -495,13 +530,16 @@ static gchar *build_lua_command(const gchar *command, const gchar *control_id,
     "      list = function()\n"
     "        return exposure_control_metadata()\n"
     "      end,\n"
+    "      snapshot = function()\n"
+    "        return exposure_control_object()\n"
+    "      end,\n"
     "      set = function(value)\n"
     "        return set_exposure_control(value)\n"
     "      end\n"
     "    }\n"
     "  end\n"
     "\n"
-    "  local function control_registry()\n"
+    "  control_registry = function()\n"
     "    return { ['exposure.exposure'] = exposure_control_adapter() }\n"
     "  end\n"
     "\n"
@@ -577,6 +615,7 @@ static gchar *build_lua_command(const gchar *command, const gchar *control_id,
     "  bridge.exposure_action = exposure_action\n"
     "  bridge.session_object = session_object\n"
     "  bridge.get_session = get_session\n"
+    "  bridge.get_snapshot_json = get_snapshot_json\n"
     "  bridge.list_controls = list_controls\n"
     "  bridge.get_control = get_control\n"
     "  bridge.set_control = set_control\n"
@@ -592,6 +631,8 @@ static gchar *build_lua_command(const gchar *command, const gchar *control_id,
     "local response\n"
     "if command == 'get-session' then\n"
     "  response = bridge.get_session()\n"
+    "elseif command == 'get-snapshot' then\n"
+    "  return bridge.get_snapshot_json()\n"
     "elseif command == 'list-controls' then\n"
     "  response = bridge.list_controls()\n"
     "elseif command == 'get-control' then\n"
@@ -637,6 +678,10 @@ int main(int argc, char **argv)
   if(argc == 2 && !strcmp(argv[1], "get-session"))
   {
     command = "get-session";
+  }
+  else if(argc == 2 && !strcmp(argv[1], "get-snapshot"))
+  {
+    command = "get-snapshot";
   }
   else if(argc == 2 && !strcmp(argv[1], "list-controls"))
   {
